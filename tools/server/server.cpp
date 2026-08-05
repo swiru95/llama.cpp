@@ -1,5 +1,8 @@
 #include "server-context.h"
 #include "server-http.h"
+#include "server-auth.h"
+#include "server-metrics.h"
+#include "server-ssrf.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
@@ -174,6 +177,38 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return 1;
     }
 
+    // Initialize auth system
+    if (!server_auth::init(params)) {
+        SRV_ERR("%s", "failed to initialize auth system\n");
+        return 1;
+    }
+
+    // Initialize SSRF allowlist for /cors-proxy (F014)
+    if (!server_ssrf::configure(params)) {
+        SRV_ERR("%s", "failed to configure SSRF allowlist\n");
+        return 1;
+    }
+
+    // B1-d: Warn if trusted proxies and /cors-proxy allowlist overlap
+    if (!params.auth_trusted_proxies.empty() && params.ui_mcp_proxy && server_ssrf::enabled()) {
+        SRV_WRN("cors-proxy: --auth-trusted-proxies and --proxy-allowed-hosts both configured; verify allowlist scope does not overlap with trusted proxy addresses %s\n", "");
+    }
+
+    // R-A5: --proxy-allowed-hosts set but /cors-proxy not enabled; the allowlist has no effect
+    if (server_ssrf::enabled() && !params.ui_mcp_proxy) {
+        SRV_WRN("%s", "--proxy-allowed-hosts is set but /cors-proxy is not enabled (--ui-mcp-proxy/-ag); the allowlist has no effect\n");
+    }
+
+    // deny-by-default: /cors-proxy enabled with no allowlist denies every target; warn, do not abort
+    if (params.ui_mcp_proxy && !server_ssrf::enabled()) {
+        SRV_WRN("%s", "--ui-mcp-proxy is enabled but --proxy-allowed-hosts is not set; /cors-proxy will deny every target (deny by default)\n");
+    }
+
+    // R-A7: Warn if /tools grants command execution to PERM_PROXY holders
+    if (!params.server_tools.empty() && server_auth::enabled()) {
+        SRV_WRN("/tools: any role granted PERM_PROXY can execute exec_shell_command; audit carefully %s\n", "");
+    }
+
     //
     // Router
     //
@@ -232,7 +267,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    ctx_http.get ("/metrics",                  ex_wrapper(server_metrics_wrap(routes.get_metrics)));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
@@ -354,6 +389,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
     } else {
         ctx_http.get ("/tools",           ex_wrapper(res_403));
         ctx_http.post("/tools",           ex_wrapper(res_403));
+    }
+
+    // Check that all registered routes have auth policy entries
+    if (!server_auth::assert_routes_covered(ctx_http.registered_routes)) {
+        return 1;
     }
 
     if (warn_names.size() > 0) {

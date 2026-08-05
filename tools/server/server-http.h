@@ -1,5 +1,7 @@
 #pragma once
 
+#include "server-auth.h"
+
 #include <atomic>
 #include <functional>
 #include <map>
@@ -29,6 +31,15 @@ struct server_http_res {
         return next != nullptr;
     }
 
+    // F013: SSE chunk written just before this stream is cut because the caller's access
+    // token expired. Empty means "use server_auth::sse_expired_chunk_oai()". A producer
+    // whose SSE dialect differs (Anthropic, Responses) sets it at response-construction time.
+    std::string sse_expired_chunk;
+
+    // F013: True if the stream was cut due to auth expiry; used by on_complete() to evict
+    // the replay session instead of draining it.
+    bool auth_expired = false;
+
     // fired before req and res are destroyed
     virtual void on_complete() {}
 
@@ -55,6 +66,8 @@ struct server_http_req {
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
 
+    server_auth_principal principal;  // F005: resolved identity for this request
+
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);
         if (it != params.end()) {
@@ -74,6 +87,7 @@ struct server_http_context {
     // note: the handler should never throw exceptions
     using handler_t = std::function<server_http_res_ptr(const server_http_req & req)>;
     mutable std::unordered_map<std::string, handler_t> handlers;
+    mutable std::vector<std::pair<std::string, std::string>> registered_routes;  // (method, path)
 
     std::string path_prefix;
     std::string hostname;

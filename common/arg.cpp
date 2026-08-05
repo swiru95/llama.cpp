@@ -3,6 +3,7 @@
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
+#include "config.h"
 #include "download.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
@@ -729,27 +730,47 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // Helper function to resolve config file path (from argv or env)
+    auto resolve_config_path = [&]() -> std::string {
+        // Scan argv for --config (with _ -> - normalization)
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg.compare(0, 2, "--") == 0) {
+                std::replace(arg.begin(), arg.end(), '_', '-');
+            }
+            if (arg == "--config" || arg == "--c") {
+                if (i + 1 < argc) {
+                    return argv[i + 1]; // last occurrence wins
+                }
+            }
+        }
+        // Fall back to env var
+        const char * env_config = std::getenv("LLAMA_ARG_CONFIG");
+        return env_config ? env_config : "";
+    };
+
     // handle command line arguments
-    auto check_arg = [&](int i) {
-        if (i+1 >= argc) {
+    auto check_arg = [&](size_t i, size_t size) {
+        if (i+1 >= size) {
             throw std::invalid_argument("expected value for argument");
         }
     };
 
-    auto parse_cli_args = [&]() {
+    // Shared token-processing core: handles both config tokens and CLI args
+    auto apply_tokens = [&](const std::vector<std::string> & toks, bool warn_dups) {
         std::set<std::string> seen_args;
 
-        for (int i = 1; i < argc; i++) {
+        for (size_t i = 0; i < toks.size(); i++) {
             const std::string arg_prefix = "--";
 
-            std::string arg = argv[i];
+            std::string arg = toks[i];
             if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
                 std::replace(arg.begin(), arg.end(), '_', '-');
             }
             if (arg_to_options.find(arg) == arg_to_options.end()) {
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
-            if (!seen_args.insert(arg).second) {
+            if (warn_dups && !seen_args.insert(arg).second) {
                 const bool skip = (arg == "--spec-type");
 
                 if (!skip) {
@@ -759,7 +780,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
             bool is_positive = tmp.second;
-            if (opt.has_value_from_env()) {
+            if (warn_dups && opt.has_value_from_env()) {
                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
             }
             try {
@@ -773,8 +794,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
-                check_arg(i);
-                std::string val = argv[++i];
+                check_arg(i, toks.size());
+                std::string val = toks[++i];
                 if (opt.handler_int) {
                     opt.handler_int(params, std::stoi(val));
                     continue;
@@ -785,8 +806,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with 2 values
-                check_arg(i);
-                std::string val2 = argv[++i];
+                check_arg(i, toks.size());
+                std::string val2 = toks[++i];
                 if (opt.handler_str_str) {
                     opt.handler_str_str(params, val, val2);
                     continue;
@@ -796,6 +817,48 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     "error while handling argument \"%s\": %s\n\n"
                     "usage:\n%s\n\nto show complete usage, run with -h",
                     arg.c_str(), e.what(), opt.to_string().c_str()));
+            }
+        }
+    };
+
+    // Load and apply config file (before ENV pass for precedence: CLI > env > config > defaults)
+    std::string config_path = resolve_config_path();
+    if (!config_path.empty()) {
+        try {
+            auto lookup = [&](const std::string & flag) -> const common_arg * {
+                auto it = arg_to_options.find(flag);
+                return it == arg_to_options.end() ? nullptr : it->second.first;
+            };
+            std::string inline_policy_json;
+            std::vector<std::string> config_tokens = common_config_to_args(config_path, lookup, inline_policy_json);
+            apply_tokens(config_tokens, /*warn_dups=*/false);
+            // F012c: Apply inline auth_policy if present
+            if (!inline_policy_json.empty()) {
+                params.auth_policy_inline = inline_policy_json;
+            }
+        } catch (const std::exception & e) {
+            throw std::invalid_argument(e.what());
+        }
+    }
+
+    auto parse_cli_args = [&]() {
+        // Convert argv to vector (skip program name at argv[0])
+        std::vector<std::string> cli_tokens;
+        for (int i = 1; i < argc; i++) {
+            cli_tokens.push_back(argv[i]);
+        }
+
+        std::set<std::string> seen_args;
+        apply_tokens(cli_tokens, /*warn_dups=*/true);
+
+        // Extract seen_args for the deprecation check below
+        for (const auto & token : cli_tokens) {
+            std::string arg = token;
+            if (arg.compare(0, 2, "--") == 0) {
+                std::replace(arg.begin(), arg.end(), '_', '-');
+            }
+            if (arg_to_options.find(arg) != arg_to_options.end()) {
+                seen_args.insert(arg);
             }
         }
 
@@ -1401,6 +1464,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.server_base = value;
         }
     ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--config"}, "PATH",
+        string_format("load parameters from a YAML config file (default: none)"),
+        [](common_params & params, const std::string & value) {
+            params.config_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON})
+    .set_env("LLAMA_ARG_CONFIG"));
     add_opt(common_arg(
         {"--verbose-prompt"},
         string_format("print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false"),
@@ -3372,6 +3443,53 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
     add_opt(common_arg(
+        {"--auth-policy-file"}, "PATH",
+        "path to a JSON RBAC policy file (roles, api_keys sha256->role, public_endpoints, "
+        "default_role). When unset, a valid API key grants full access (legacy behavior). "
+        "In RBAC mode, endpoints needing PROXY (/cors-proxy, /tools) require a role that "
+        "explicitly lists \"PROXY\".",
+        [](common_params & params, const std::string & value) {
+            params.auth_policy_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AUTH_POLICY_FILE"));
+    add_opt(common_arg(
+        {"--auth-audit-log"}, "PATH",
+        "append one JSON line per auth decision to PATH (ts, subject_hash, method, path, "
+        "decision, required_perm, auth_method, peer_ip, request_id). No tokens, headers, keys, "
+        "or prompts are ever written.",
+        [](common_params & params, const std::string & value) {
+            params.auth_audit_log = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AUTH_AUDIT_LOG"));
+    add_opt(common_arg(
+        {"--auth-trusted-proxies"}, "CIDR[,CIDR...]",
+        "comma-separated IPv4/IPv6 CIDRs of the fronting proxy whose requests may carry identity "
+        "via X-Auth-Subject / X-Auth-Roles. These headers are honored only from a listed peer and "
+        "are always stripped before handler dispatch. Setting this ENABLES auth enforcement "
+        "(deny-by-default) even with no --api-key/--auth-policy-file, so direct non-proxy clients "
+        "then get 401 on protected routes. Use the proxy's own address (host /32 or /128, or its "
+        "subnet), never 0.0.0.0/0 or ::/0. 127.0.0.1 and ::1 are different families - list both if "
+        "the proxy may use either. Unset = never trust identity headers. The listed proxy MUST "
+        "strip any client-supplied X-Auth-Subject/X-Auth-Roles and set them itself - llama-server "
+        "trusts them verbatim from a listed peer.",
+        [](common_params & params, const std::string & value) {
+            params.auth_trusted_proxies = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AUTH_TRUSTED_PROXIES"));
+    add_opt(common_arg(
+        {"--proxy-allowed-hosts"}, "target[:port][,...]",
+        "comma-separated allowlist for /cors-proxy SSRF hardening (requires --ui-mcp-proxy). "
+        "Each entry is hostname, IPv4 CIDR, or [IPv6] CIDR with optional :port or :* suffix. "
+        "No :port means only 80/443 allowed (fail-closed default). Entry grammar: "
+        "hostname | IPv4 | IPv4/bits | [IPv6] | [IPv6]/bits, each with optional :PORT or :*. "
+        "A hostname entry can only reach public addresses (private ranges always blocked). "
+        "Examples: mcp.corp.example, 127.0.0.1/32:9000, [::1]/128:5000. "
+        "Deny-by-default: unset allowlist blocks all proxies.",
+        [](common_params & params, const std::string & value) {
+            params.proxy_allowed_hosts = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROXY_ALLOWED_HOSTS"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {
@@ -3385,6 +3503,157 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ssl_file_cert = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSL_CERT_FILE"));
+    add_opt(common_arg(
+        {"--mtls-client-ca-file"}, "PATH",
+        "path to a PEM-encoded client CA certificate file for mTLS (optional with --mtls-client-ca-dir). "
+        "Not a secret.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_client_ca_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_CLIENT_CA_FILE"));
+    add_opt(common_arg(
+        {"--mtls-client-ca-dir"}, "PATH",
+        "path to a directory of PEM-encoded client CA certificates for mTLS (optional with --mtls-client-ca-file). "
+        "Not a secret.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_client_ca_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_CLIENT_CA_DIR"));
+    add_opt(common_arg(
+        {"--mtls-required"}, "{off|optional|required}",
+        "client certificate enforcement mode (default: off). 'optional' and 'required' enable authentication "
+        "enforcement (deny-by-default) and require an --auth-policy-file with an mtls.role_map to authorize "
+        "clients. Revocation checking is opt-in via --mtls-crl-file; OCSP is not implemented. "
+        "Short-lived certificates (SPIFFE/SVID recommended) remain the lower-maintenance alternative. "
+        "C2: SAN keys in role_map are matched byte-exact (no percent-decode, case-fold, or trailing-dot normalization). "
+        "C3: a trailing '*' wildcard matches any byte suffix (not segment-bounded); include delimiters (e.g., 'spiffe://corp/ns/*') "
+        "and map wildcards to least-privilege roles.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_required = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_REQUIRED"));
+    add_opt(common_arg(
+        {"--mtls-verify-depth"}, "N",
+        "maximum intermediate CA depth in the client certificate chain for mTLS (default 1: leaf signed directly "
+        "by a configured CA, typical for SPIFFE). Set to 0 if the client cert must be signed directly by the CA, "
+        "or higher for deeper PKI chains.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_verify_depth = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_VERIFY_DEPTH"));
+    add_opt(common_arg(
+        {"--tls-min-version"}, "{1.2|1.3}",
+        "minimum TLS version for any HTTPS server (default 1.2). Applies to both plain HTTPS and mTLS. "
+        "1.3 is recommended for modern deployments.",
+        [](common_params & params, const std::string & value) {
+            params.tls_min_version = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TLS_MIN_VERSION"));
+    add_opt(common_arg(
+        {"--mtls-crl-file"}, "PATH",
+        "path to a PEM file containing one or more X.509 CRLs for client-certificate revocation checking. "
+        "Requires --mtls-required optional or required; setting this flag with mTLS off aborts startup. "
+        "With the default --mtls-verify-depth 1 (leaf cert signed directly by the configured client CA), "
+        "exactly one CRL (issued by the client CA) is required; the self-signed root CA does not need a CRL. "
+        "CRL is loaded once at startup unless --mtls-crl-reload-interval is set (F016). "
+        "If OpenSSL reports 'X509_V_ERR_UNABLE_TO_GET_CRL' on the client, the CRL may be for a different CA. "
+        "Not a secret; safe on argv.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_crl_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_CRL_FILE"));
+    add_opt(common_arg(
+        {"--mtls-crl-reload-interval"}, "SECONDS",
+        "F016: poll interval (seconds) for reloading --mtls-crl-file without restarting the server. "
+        "Default 0 (disabled). Requires an OpenSSL 3.0+ build. When enabled, session resumption "
+        "(tickets, session cache) is disabled so revocation takes effect within the interval. "
+        "Note: --mtls-client-ca-file is loaded once at startup; only the CRL is reloaded. "
+        "Minimum 5 (to prevent a hot loop). A reload failure keeps the last-known-good CRL and logs SRV_ERR. "
+        "The design prefers short-lived certificates and this flag is optional.",
+        [](common_params & params, const std::string & value) {
+            params.mtls_crl_reload_interval = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTLS_CRL_RELOAD_INTERVAL"));
+    add_opt(common_arg(
+        {"--oidc-issuer"}, "URL",
+        "OIDC issuer URL; used for discovery of the JWKS endpoint and as the exact 'iss' claim the token must carry. "
+        "REQUIRED whenever OIDC is enabled, even with --oidc-jwks-url. Setting --oidc-issuer or --oidc-jwks-url "
+        "ENABLES auth enforcement (deny-by-default) and requires an --auth-policy-file with an oidc.role_map to authorize users. "
+        "llama-server validates access tokens locally as a resource server; it does NOT implement the authorization-code "
+        "flow, sessions, or cookies. None/HS* algorithms are never accepted. Opaque (non-JWT) tokens are validated via "
+        "--oidc-introspection-url if set, otherwise rejected. Setting --oidc-issuer together with introspection also "
+        "enables the full JWKS path (mandatory audience/discovery/initial fetch) for JWT-shaped tokens.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_issuer = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_ISSUER"));
+    add_opt(common_arg(
+        {"--oidc-jwks-url"}, "URL",
+        "explicit JWKS endpoint URL; overrides discovery from --oidc-issuer. Must be https. Redirects are NOT followed.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_jwks_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_JWKS_URL"));
+    add_opt(common_arg(
+        {"--oidc-audience"}, "STR[,STR...]",
+        "comma-separated list of acceptable values for the 'aud' (audience) claim; at least one required whenever "
+        "OIDC is enabled, including introspection-only mode (--oidc-introspection-url with no issuer/jwks-url). "
+        "The token 'aud' (or the introspection response's 'aud') must contain one of these.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_audience = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_AUDIENCE"));
+    add_opt(common_arg(
+        {"--oidc-algs"}, "ALG[,ALG...]",
+        string_format("comma-separated list of allowed JWT signature algorithms; asymmetric only (default: %s). "
+                      "none and HS* are rejected (algorithm confusion guard).", params.oidc_algs.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.oidc_algs = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_ALGS"));
+    add_opt(common_arg(
+        {"--oidc-ca-file"}, "PATH",
+        "optional CA bundle to PIN verification of the IdP/JWKS TLS certificate; when unset, the system CA store is used. "
+        "Server-certificate verification is ALWAYS on and cannot be disabled. Not a secret. "
+        "Once OIDC is enabled, an Authorization: Bearer value with JWT shape (three dot-separated base64url segments) is "
+        "routed to OIDC validation and, if invalid, returns 401 with NO fallback to API-key auth. An API key that happens "
+        "to be coincidentally JWT-shaped would therefore be rejected; keep API keys non-dotted.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_ca_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_CA_FILE"));
+    add_opt(common_arg(
+        {"--oidc-clock-skew"}, "SEC",
+        string_format("leeway (in seconds) for validating token exp/nbf/iat claims (default: %d, clamped to [0,300])", params.oidc_clock_skew),
+        [](common_params & params, int value) {
+            params.oidc_clock_skew = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_CLOCK_SKEW"));
+    add_opt(common_arg(
+        {"--oidc-introspection-url"}, "URL",
+        "RFC 7662 endpoint for validating OPAQUE (non-JWT) bearer tokens. Must be https; redirects not followed. "
+        "Enabling it turns deny-by-default enforcement on (same as --oidc-issuer). Every unauthenticated request "
+        "to a public route carrying a Bearer header is a potential outbound request; the endpoint should be "
+        "reachable only from the server.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_introspection_url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_INTROSPECTION_URL"));
+    add_opt(common_arg(
+        {"--oidc-client-id"}, "STR",
+        "client ID for introspection endpoint HTTP Basic authentication. Not a secret.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_client_id = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_CLIENT_ID"));
+    add_opt(common_arg(
+        {"--oidc-client-secret-file"}, "PATH",
+        "file containing the introspection client secret (read once at startup). The secret is NEVER logged, "
+        "audited, or passed via argv/env. Binary read, all trailing CR/LF stripped; interior newline = malformed file = startup abort.",
+        [](common_params & params, const std::string & value) {
+            params.oidc_client_secret_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_OIDC_CLIENT_SECRET_FILE"));
     add_opt(common_arg(
         {"--chat-template-kwargs"}, "STRING",
         "sets additional params for the json template parser, must be a valid json object string, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'",

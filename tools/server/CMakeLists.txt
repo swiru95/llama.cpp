@@ -41,13 +41,24 @@ add_library(${TARGET}
     server.cpp
     server-http.cpp
     server-http.h
+    server-auth.cpp
+    server-auth.h
+    server-ssrf.cpp
+    server-ssrf.h
+    server-mtls.cpp
+    server-mtls.h
+    server-oidc.cpp
+    server-oidc.h
     server-models.cpp
     server-models.h
+    vendor/sha256.cpp
+    vendor/sha256.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE vendor/jwt-cpp/include)
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 if(LLAMA_TOOLS_INSTALL)

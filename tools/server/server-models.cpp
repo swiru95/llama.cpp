@@ -2044,7 +2044,8 @@ server_http_proxy::server_http_proxy(
         const std::map<std::string, uploaded_file> & files,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
-        int32_t timeout_write
+        int32_t timeout_write,
+        const server_http_proxy_opts & opts
         ) {
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
@@ -2059,7 +2060,12 @@ server_http_proxy::server_http_proxy(
     }
 
     // setup Client
-    cli->set_follow_location(true);
+    cli->set_follow_location(opts.follow_location);
+    if (!opts.pinned_ip.empty()) {
+        // connect to the address the caller already validated; httplib resolves an addr_map
+        // entry with AI_NUMERICHOST and keeps host_ for Host/SNI/cert verification
+        cli->set_hostname_addr_map({{host, opts.pinned_ip}});
+    }
     cli->set_connection_timeout(timeout_read, 0); // use --timeout value instead of hardcoded 5 s
     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
     cli->set_read_timeout(timeout_write, 0);
@@ -2080,13 +2086,23 @@ server_http_proxy::server_http_proxy(
     };
 
     // wire up the HTTP client
-    // note: do NOT capture `this` pointer, as it may be destroyed before the thread ends
-    httplib::ResponseHandler response_handler = [pipe, cli](const httplib::Response & response) {
+    // note: do NOT capture `this` pointer, as it may be destroyed before the thread ends.
+    // Likewise do NOT capture `opts` by reference: it is a reference parameter of this
+    // constructor, and response_handler is stored inside `req`, which the proxy thread below
+    // captures BY VALUE and may still be running after this constructor has returned (e.g. if
+    // the caller's should_stop fires before headers arrive) - a reference capture here would be
+    // a dangling reference in that case. Capture the one bool it needs, by value, instead.
+    const bool strip_location = !opts.follow_location; // R-A4
+    httplib::ResponseHandler response_handler = [pipe, cli, strip_location](const httplib::Response & response) {
         msg_t msg;
         msg.status = response.status;
         for (const auto & [key, value] : response.headers) {
             const auto lowered = to_lower_copy(key);
             if (should_strip_proxy_header(lowered)) {
+                continue;
+            }
+            // R-A4: strip Location header when follow_location is false (cors-proxy)
+            if (strip_location && lowered == "location") {
                 continue;
             }
             if (lowered == "content-type") {
