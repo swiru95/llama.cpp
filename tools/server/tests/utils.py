@@ -173,10 +173,12 @@ class ServerProcess:
             self.server_port = int(os.environ["PORT"])
         self.external_server = "DEBUG_EXTERNAL" in os.environ
 
-    def start(self, timeout_seconds: int = DEFAULT_HTTP_TIMEOUT) -> None:
-        env = {**os.environ}
+    def start(self, timeout_seconds: int = DEFAULT_HTTP_TIMEOUT, env: dict | None = None) -> None:
+        merged_env = {**os.environ}
         if "LLAMA_CACHE" not in os.environ:
-            env["LLAMA_CACHE"] = "tmp"
+            merged_env["LLAMA_CACHE"] = "tmp"
+        if env:
+            merged_env.update(env)
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return
@@ -362,7 +364,7 @@ class ServerProcess:
         if self.backend_sampling:
             server_args.append("--backend_sampling")
         if self.gcp_compat:
-            env["AIP_MODE"] = "PREDICTION"
+            merged_env["AIP_MODE"] = "PREDICTION"
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
@@ -383,7 +385,7 @@ class ServerProcess:
             creationflags=flags,
             stdout=self._log,
             stderr=self._log if self._log != sys.stdout else sys.stdout,
-            env=env,
+            env=merged_env,
         )
         server_instances.add(self)
 

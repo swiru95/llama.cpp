@@ -138,3 +138,73 @@ def test_public_health_not_audited_in_auth_disabled_mode():
         lines = _read_audit_lines(server)
         assert all("health" not in r["path"] for r in lines)
         os.unlink(server._audit_path)
+
+
+def test_distinct_request_ids_on_each_audit_line():
+    # Catch hoisting error in lazy request_id generation: each audit line must have unique ID
+    server = _audit_server(api_key=TEST_KEY)
+    try:
+        server.start()
+        # Make two requests that will be audited
+        server.make_request("GET", "/props")
+        server.make_request("GET", "/props")
+    finally:
+        server.stop()
+    lines = _read_audit_lines(server)
+    request_ids = [r["request_id"] for r in lines if r["path"] == "/props"]
+    assert len(request_ids) >= 2, f"expected at least 2 audit lines, got {len(request_ids)}"
+    assert len(set(request_ids)) == len(request_ids), f"request_ids should be distinct, got {request_ids}"
+    os.unlink(server._audit_path)
+
+
+def test_auth_disabled_with_audit_produces_allow_for_non_public():
+    # auth disabled (no api key, no policy) but audit enabled.
+    # hit a non-public route, verify: subject_hash="anonymous", auth_method="none", decision="allow"
+    server = _audit_server()
+    try:
+        server.start()
+        # /props is not a public route (requires READ_STATE permission)
+        status = server.make_request("GET", "/props").status_code
+        assert status == 200, f"auth-disabled mode should allow /props, got {status}"
+    finally:
+        server.stop()
+    if os.path.exists(server._audit_path):
+        lines = _read_audit_lines(server)
+        props_lines = [r for r in lines if r["path"] == "/props"]
+        assert len(props_lines) > 0, "expected at least one audit line for /props"
+        line = props_lines[0]
+        assert line["subject_hash"] == "anonymous", f"expected subject_hash='anonymous', got {line['subject_hash']}"
+        assert line["auth_method"] == "none", f"expected auth_method='none', got {line['auth_method']}"
+        assert line["decision"] == "allow", f"expected decision='allow', got {line['decision']}"
+        os.unlink(server._audit_path)
+
+
+def test_sha256_known_answer():
+    # Known-answer check end-to-end using LLAMA_AUTH_AUDIT_SALT env var
+    import hashlib
+    server = _audit_server(trusted_proxies="127.0.0.1/32")
+    known_salt = "fixed-test-salt"
+    known_subject = "testsubject@example.com"
+    try:
+        # Set the auth audit salt via environment variable
+        os_env = os.environ.copy()
+        os_env["LLAMA_AUTH_AUDIT_SALT"] = known_salt
+        server.start(env=os_env)
+        # Make request with trusted proxy and X-Auth-Subject header
+        headers = {
+            "X-Auth-Subject": known_subject,
+            "X-Forwarded-For": "127.0.0.1"
+        }
+        server.make_request("GET", "/props", headers=headers)
+    finally:
+        server.stop()
+    if os.path.exists(server._audit_path):
+        lines = _read_audit_lines(server)
+        props_lines = [r for r in lines if r["path"] == "/props"]
+        assert len(props_lines) > 0, "expected at least one audit line for /props"
+        line = props_lines[0]
+        # Calculate the expected hash using Python's hashlib
+        expected_hash = hashlib.sha256((known_subject + known_salt).encode()).hexdigest()
+        assert line["subject_hash"] == expected_hash, \
+            f"SHA-256 mismatch: expected {expected_hash}, got {line['subject_hash']}"
+        os.unlink(server._audit_path)

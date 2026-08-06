@@ -53,6 +53,7 @@ namespace {
     std::vector<route_entry_rt> g_route_table;
     std::unordered_map<std::string, key_entry> g_key_perms;  // hash -> {perms, role}
     std::string g_api_prefix;
+    std::string g_api_prefix_slash;  // precomputed g_api_prefix + "/" (avoid per-request concatenation)
     bool g_auth_enabled = false;  // true if policy or api_keys configured
     uint32_t g_default_perms = 0;  // default permissions for unmapped keys (or 0 for deny)
 
@@ -86,13 +87,20 @@ namespace {
     std::vector<cidr> g_trusted_proxies;                       // trusted peer CIDRs
 
     // F008d: mTLS role mapping
-    struct mtls_map_entry { std::string pattern; bool wildcard; uint32_t perms; std::string role; };
+    struct mtls_map_entry {
+        std::string pattern;
+        bool wildcard;
+        size_t prefix_len;  // length of prefix (pattern minus '*'), 0 if not wildcard
+        uint32_t perms;
+        std::string role;
+    };
     std::string g_mtls_identity_source = "san_uri";            // "san_uri" | "san_dns"
     std::vector<mtls_map_entry> g_mtls_role_map;               // built in init
 
     // F009d: OIDC role mapping
     bool g_oidc_enabled = false;                               // set true after server_oidc::init succeeds
     std::string g_oidc_roles_claim = "realm_access.roles";     // dot-separated claim path
+    std::vector<std::string> g_oidc_roles_claim_segs;          // pre-split segments (avoid per-request parse)
     std::unordered_map<std::string, uint32_t> g_oidc_role_map; // claim-role -> perms
     bool g_oidc_require_typ = false;                           // from policy oidc.require_at_jwt_typ
 
@@ -117,51 +125,42 @@ server_norm_status server_auth::normalize_path(const std::string & raw_path,
     // We do NOT decode again. We inspect the already-once-decoded path and reject
     // any residual malformed sequences.
 
-    std::string work = raw_path;
+    // Step 1: Handle api_prefix (if configured). When g_api_prefix is empty (default),
+    // operate on raw_path directly to avoid a full copy.
+    const std::string * work_ptr = &raw_path;
+    std::string work_copy;
 
-    // Step 1: Strip api_prefix. A path outside the prefix cannot reach a
-    // prefixed handler, so it is not a protected API route.
     if (!g_api_prefix.empty()) {
-        if (work == g_api_prefix) {
-            work = "/";
-        } else if (work.rfind(g_api_prefix + "/", 0) == 0) {
-            work = work.substr(g_api_prefix.size());
+        if (raw_path == g_api_prefix) {
+            work_copy = "/";
+            work_ptr = &work_copy;
+        } else if (raw_path.rfind(g_api_prefix_slash, 0) == 0) {  // use precomputed g_api_prefix_slash
+            work_copy = raw_path.substr(g_api_prefix.size());
+            work_ptr = &work_copy;
         } else {
             return NORM_UNMATCHED;
         }
     }
 
-    // Step 2: Reject non-canonical paths
-    // Scan for:
-    // - NUL byte
-    // - literal '%'
-    // - backslash
-    // - empty segment (consecutive '/')
-    // - trailing '/' (except root "/")
+    const std::string & work = *work_ptr;
+
+    // Step 2: Reject non-canonical paths. Scan for:
+    // - NUL byte, literal '%', backslash
+    // - empty segment (consecutive '/'), trailing '/' (except root "/")
     // - whole '.' or '..' segment
-
-    // Check for NUL byte
-    if (work.find('\0') != std::string::npos) {
-        return NORM_REJECT;
-    }
-
-    // Check for literal '%' (residue of double-encoding; httplib already decoded once)
-    if (work.find('%') != std::string::npos) {
-        return NORM_REJECT;
-    }
-
-    // Check for backslash
-    if (work.find('\\') != std::string::npos) {
-        return NORM_REJECT;
-    }
+    // Single combined pass through the path.
 
     // Check for trailing slash (except root "/")
     if (work.size() > 1 && work.back() == '/') {
         return NORM_REJECT;
     }
 
-    // Check for empty segments (consecutive '/') and whole '.' / '..' segments
-    // Split by '/', check each segment
+    // Check for empty path or missing leading slash
+    if (work.empty() || work[0] != '/') {
+        return NORM_REJECT;
+    }
+
+    // Combined scan: invalid chars and segment validation in one pass
     size_t prev = 0;
     for (size_t i = 0; i <= work.size(); ++i) {
         if (i == work.size() || work[i] == '/') {
@@ -170,26 +169,31 @@ server_norm_status server_auth::normalize_path(const std::string & raw_path,
                 prev = i + 1;
                 continue;
             }
-            std::string segment = work.substr(prev, i - prev);
+            size_t seg_len = i - prev;
             // Empty segment (consecutive '/', e.g., //slots or /slots//0)
-            if (segment.empty()) {
+            if (seg_len == 0) {
                 return NORM_REJECT;
             }
-            // Whole '.' or '..' segment
-            if (segment == "." || segment == "..") {
+            // Whole '.' or '..' segment (checked by length and first byte(s))
+            if (seg_len == 1 && work[prev] == '.') {
+                return NORM_REJECT;
+            }
+            if (seg_len == 2 && work[prev] == '.' && work[prev + 1] == '.') {
                 return NORM_REJECT;
             }
             prev = i + 1;
+        } else if (work[i] == '\0' || work[i] == '%' || work[i] == '\\') {
+            // NUL, '%', or backslash
+            return NORM_REJECT;
         }
     }
 
-    // Step 3: Ensure leading slash (should not fail after step 1, but fail closed)
-    if (work.empty() || work[0] != '/') {
-        return NORM_REJECT;
+    // Step 3: Return normalized (unchanged from input in F001, since no repair)
+    if (work_ptr == &work_copy) {
+        out_normalized = work_copy;
+    } else {
+        out_normalized = raw_path;
     }
-
-    // Step 4: Return normalized (unchanged from input in F001, since no repair)
-    out_normalized = work;
     return NORM_OK;
 }
 
@@ -276,13 +280,27 @@ static const auth_route k_routes[] = {
 
 static const size_t k_routes_count = sizeof(k_routes) / sizeof(k_routes[0]);
 
-// Split path by '/'
+// Split path by '/' - using find/substr for efficiency (no stringstream per call).
+// Edge cases (must match std::getline behavior for backward compatibility):
+// - split_path("/props") yields {"", "props"} (leading empty from leading slash)
+// - split_path("/") yields {""} (single empty, NOT two; trailing getline fails on EOF)
+// - split_path("") yields {} (empty vector, no leading slash = no segments)
 static std::vector<std::string> split_path(const std::string & path) {
     std::vector<std::string> segments;
-    std::stringstream ss(path);
-    std::string segment;
-    while (std::getline(ss, segment, '/')) {
-        segments.push_back(segment);
+    if (path.empty()) {
+        return segments;  // empty path -> empty vector
+    }
+    segments.reserve(path.size() / 2);  // typical estimate
+    size_t start = 0;
+    for (size_t i = 0; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '/') {
+            // Only push if we found a '/' (i < size) or if there's content after last delim
+            if (i < path.size() || start < path.size()) {
+                segments.push_back(path.substr(start, i - start));
+            }
+            start = i + 1;
+            if (i == path.size()) break;  // EOF: stop here
+        }
     }
     return segments;
 }
@@ -310,15 +328,15 @@ static bool path_matches(const std::vector<std::string> & pattern_segs,
     return true;
 }
 
-// F007: Strip IPv4-mapped prefix from IPv6 addresses (e.g., ::ffff:127.0.0.1 -> 127.0.0.1)
+// F007: Strip IPv4-mapped prefix from IPv6 addresses (e.g., ::ffff:127.0.0.1 -> 127.0.0.1).
+// Avoids string construction for the prefix check.
 static std::string strip_v4mapped_prefix(const std::string & addr) {
-    const std::string prefix = "::ffff:";
-    if (addr.size() > prefix.size() && addr.substr(0, prefix.size()) == prefix) {
-        std::string candidate = addr.substr(prefix.size());
+    if (addr.size() > 7 && addr.compare(0, 7, "::ffff:") == 0) {
         // Try to parse the remainder as IPv4 to confirm it's a valid v4-mapped address
         uint8_t buf[4];
-        if (inet_pton(AF_INET, candidate.c_str(), buf) == 1) {
-            return candidate;
+        const char * candidate = addr.c_str() + 7;
+        if (inet_pton(AF_INET, candidate, buf) == 1) {
+            return addr.substr(7);
         }
     }
     return addr;
@@ -370,17 +388,24 @@ static bool peer_is_trusted(const std::string & peer_addr) {
     return false;
 }
 
-// F007: Split comma-separated string into tokens (trim whitespace, drop empty)
+// F007: Split comma-separated string into tokens (trim whitespace, drop empty).
+// Avoids stringstream per call.
 static std::vector<std::string> split_csv(const std::string & s) {
     std::vector<std::string> result;
-    std::stringstream ss(s);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        // Trim leading/trailing whitespace
-        size_t start = token.find_first_not_of(" \t\r\n");
-        size_t end = token.find_last_not_of(" \t\r\n");
-        if (start != std::string::npos) {
-            result.push_back(token.substr(start, end - start + 1));
+    result.reserve(10);  // typical estimate: ~10 tokens per header
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == ',') {
+            // Extract token [start, i)
+            std::string token = s.substr(start, i - start);
+            // Trim leading/trailing whitespace
+            size_t tok_start = token.find_first_not_of(" \t\r\n");
+            size_t tok_end = token.find_last_not_of(" \t\r\n");
+            if (tok_start != std::string::npos) {
+                result.push_back(token.substr(tok_start, tok_end - tok_start + 1));
+            }
+            start = i + 1;
+            if (i == s.size()) break;
         }
     }
     return result;
@@ -398,7 +423,7 @@ static uint32_t perm_from_string(const std::string & name) {
 }
 
 // F006: Convert permission bitmask to name (single bit only; "" if zero/multiple)
-static std::string perm_to_string(uint32_t perm) {
+static const char * perm_to_string(uint32_t perm) {
     switch (perm) {
         case PERM_PUBLIC:       return "PUBLIC";
         case PERM_INFER:        return "INFER";
@@ -412,7 +437,7 @@ static std::string perm_to_string(uint32_t perm) {
 }
 
 // F006: Convert auth method to string
-static std::string auth_method_to_string(server_auth_method method) {
+static const char * auth_method_to_string(server_auth_method method) {
     switch (method) {
         case AUTH_NONE:           return "none";
         case AUTH_API_KEY:        return "api_key";
@@ -494,6 +519,18 @@ static std::string audit_salt() {
     return salt;
 }
 
+// F006: Generate a request ID
+static std::string request_id_generate() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, 35);
+    const char * chars = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::string id = "req-";
+    for (int i = 0; i < 12; ++i) {
+        id += chars[dist(rng)];
+    }
+    return id;
+}
+
 // F006: Emit one audit line (thread-safe, fail-open). A raw request path can
 // contain byte sequences that are not valid UTF-8 (e.g. an overlong percent-
 // decoded sequence like %C0%80); json::dump() throws on those by default.
@@ -502,8 +539,11 @@ static std::string audit_salt() {
 // the whole call is defensively wrapped.
 static void audit_emit(const server_auth_request & r, const std::string & norm_path,
                        uint32_t need, bool matched, const server_auth_principal & p,
-                       const server_auth_decision & d, const std::string & request_id) {
+                       const server_auth_decision & d) {
     if (!g_audit_enabled) return;
+
+    // Lazy request ID generation: only when audit is enabled
+    std::string request_id = request_id_generate();
 
     try {
         // Build JSON line
@@ -536,18 +576,6 @@ static void audit_emit(const server_auth_request & r, const std::string & norm_p
     }
 }
 
-// F006: Generate a request ID
-static std::string request_id_generate() {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> dist(0, 35);
-    const char * chars = "0123456789abcdefghijklmnopqrstuvwxyz";
-    std::string id = "req-";
-    for (int i = 0; i < 12; ++i) {
-        id += chars[dist(rng)];
-    }
-    return id;
-}
-
 // Load policy from JSON file
 static json load_policy_json(const std::string & path) {
     std::ifstream ifs(path);
@@ -569,8 +597,25 @@ bool server_auth::enabled() {
     return g_auth_enabled;
 }
 
+// Split a dot-separated claim path into segments (e.g., "realm_access.roles" -> {"realm_access", "roles"})
+static std::vector<std::string> split_oidc_claim_path(const std::string & path) {
+    std::vector<std::string> segments;
+    size_t start = 0;
+    for (size_t i = 0; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '.') {
+            if (i > start) {
+                segments.push_back(path.substr(start, i - start));
+            }
+            start = i + 1;
+            if (i == path.size()) break;
+        }
+    }
+    return segments;
+}
+
 bool server_auth::init(const common_params & params) {
     g_api_prefix = params.api_prefix;
+    g_api_prefix_slash = g_api_prefix.empty() ? "" : (g_api_prefix + "/");  // precomputed for normalize_path
     // F013: same leeway that jwt-cpp applied to exp at validation time
     g_stream_expiry_grace_sec = std::min<int64_t>(300, std::max<int64_t>(0, params.oidc_clock_skew));
     g_route_table.clear();
@@ -584,6 +629,7 @@ bool server_auth::init(const common_params & params) {
     g_mtls_role_map.clear();  // F008d
     g_oidc_enabled = false;  // F009d
     g_oidc_roles_claim = "realm_access.roles";  // F009d
+    g_oidc_roles_claim_segs = split_oidc_claim_path(g_oidc_roles_claim);  // pre-split for extract_oidc_roles
     g_oidc_role_map.clear();  // F009d
     g_oidc_require_typ = false;  // F009d
 
@@ -772,6 +818,10 @@ bool server_auth::init(const common_params & params) {
     }
 
     // Auth is enabled if we reach here (policy, legacy keys, trusted proxies, mTLS, OIDC, or introspection)
+    // NOTE: authorize_request depends on this OR coupling to skip expensive credential
+    // resolution when auth is disabled. If adding a new credential source here, also
+    // ensure resolve_principal is unreachable when that source alone is true and all
+    // others are false.
     g_auth_enabled = has_policy || has_api_keys || has_trusted_proxies || has_mtls || has_oidc || has_introspect;
 
     // Load or use default roles
@@ -893,6 +943,7 @@ bool server_auth::init(const common_params & params) {
                 mtls_map_entry entry;
                 entry.pattern = pattern;
                 entry.wildcard = is_wildcard;
+                entry.prefix_len = is_wildcard ? (pattern.size() - 1) : 0;
                 entry.perms = role_perms[role_name];
                 entry.role = role_name;
                 g_mtls_role_map.push_back(entry);
@@ -902,6 +953,7 @@ bool server_auth::init(const common_params & params) {
 
     // F009d: Parse OIDC policy section (after g_role_perms is persisted)
     g_oidc_roles_claim = "realm_access.roles";  // reset to default
+    g_oidc_roles_claim_segs = split_oidc_claim_path(g_oidc_roles_claim);
     g_oidc_role_map.clear();
     g_oidc_require_typ = false;
     if (!policy.is_null() && policy.contains("oidc")) {
@@ -919,6 +971,7 @@ bool server_auth::init(const common_params & params) {
                 return false;
             }
             g_oidc_roles_claim = rc.get<std::string>();
+            g_oidc_roles_claim_segs = split_oidc_claim_path(g_oidc_roles_claim);
         }
 
         // Parse require_at_jwt_typ (optional, default false)
@@ -1096,6 +1149,7 @@ struct mtls_lookup_result {
 };
 
 // F008d: Look up mTLS role mapping: exact match wins, then longest-prefix wildcard.
+// Uses precomputed prefix_len to avoid substr/string construction per request.
 // Returns {matched, perms, role}. Empty identity never matches.
 static mtls_lookup_result mtls_lookup(const std::string & identity) {
     mtls_lookup_result result;
@@ -1113,16 +1167,17 @@ static mtls_lookup_result mtls_lookup(const std::string & identity) {
         }
     }
 
-    // Second pass: longest-prefix wildcard
+    // Second pass: longest-prefix wildcard (using precomputed prefix_len)
     size_t longest_prefix_len = 0;
     uint32_t longest_perms = 0;
     std::string longest_role;
     for (const auto & entry : g_mtls_role_map) {
-        if (entry.wildcard) {
-            // Pattern is "prefix*"; check if it matches
-            std::string prefix = entry.pattern.substr(0, entry.pattern.size() - 1);
-            if (identity.size() >= prefix.size() && identity.substr(0, prefix.size()) == prefix && prefix.size() > longest_prefix_len) {
-                longest_prefix_len = prefix.size();
+        if (entry.wildcard && entry.prefix_len > 0) {
+            // entry.prefix_len is the length of the pattern without the trailing '*'
+            if (identity.size() >= entry.prefix_len &&
+                identity.compare(0, entry.prefix_len, entry.pattern.data(), entry.prefix_len) == 0 &&
+                entry.prefix_len > longest_prefix_len) {
+                longest_prefix_len = entry.prefix_len;
                 longest_perms = entry.perms;
                 longest_role = entry.role;
             }
@@ -1138,26 +1193,16 @@ static mtls_lookup_result mtls_lookup(const std::string & identity) {
     return result;
 }
 
-// F009d/F010b: Extract roles from OIDC claims JSON by following a dot-separated path.
+// F009d/F010b: Extract roles from OIDC claims JSON by following a precomputed dot-separated path.
 // OQ-B2: If the terminal segment is "scope" or "scp", split the string value on whitespace.
 // Returns empty vector on parse error, missing path, or wrong type (fail-closed).
-static std::vector<std::string> extract_oidc_roles(const std::string & claims_json, const std::string & path) {
+// segments: pre-split claim path (avoids per-request istringstream parse).
+static std::vector<std::string> extract_oidc_roles(const std::string & claims_json,
+                                                    const std::vector<std::string> & segments) {
     std::vector<std::string> result;
     try {
         json claims = json::parse(claims_json);
         json * current = &claims;
-
-        // Collect all segments to identify the last one
-        std::vector<std::string> segments;
-        {
-            std::istringstream iss(path);
-            std::string seg;
-            while (std::getline(iss, seg, '.')) {
-                if (!seg.empty()) {
-                    segments.push_back(seg);
-                }
-            }
-        }
 
         // Walk the dot-separated path
         for (const auto & seg : segments) {
@@ -1272,7 +1317,7 @@ static server_auth_principal resolve_principal(const server_auth_request & req) 
                 p.issuer = v.issuer;
                 p.subject = v.subject;
                 p.expires_at = v.expires_at;
-                p.roles = extract_oidc_roles(v.claims_json, g_oidc_roles_claim);
+                p.roles = extract_oidc_roles(v.claims_json, g_oidc_roles_claim_segs);
                 p.perms = 0;
                 // Map known roles to perms; unknown roles contribute nothing (fail-closed)
                 for (const auto & role : p.roles) {
@@ -1346,7 +1391,7 @@ static server_auth_principal resolve_principal(const server_auth_request & req) 
                 p.issuer = v.issuer;  // R11: configured issuer or "oidc-introspection"
                 p.subject = v.subject;
                 p.expires_at = v.expires_at;
-                p.roles = extract_oidc_roles(v.claims_json, g_oidc_roles_claim);
+                p.roles = extract_oidc_roles(v.claims_json, g_oidc_roles_claim_segs);
                 p.perms = 0;
                 // Map known roles to perms; unknown roles contribute nothing (fail-closed)
                 for (const auto & role : p.roles) {
@@ -1374,9 +1419,6 @@ static server_auth_principal resolve_principal(const server_auth_request & req) 
 }
 
 server_auth_decision server_auth::authorize_request(const server_auth_request & req) {
-    // F006: Generate request ID for audit
-    std::string request_id = request_id_generate();
-
     // Path normalization is input validation and must run unconditionally,
     // before the auth-disabled allow-all short-circuit (a malformed path is
     // rejected regardless of whether auth is enabled).
@@ -1390,17 +1432,11 @@ server_auth_decision server_auth::authorize_request(const server_auth_request & 
             g_authn_fail[AUTH_NONE][AUTH_FAIL_MALFORMED_PATH]++;
         }
         // Audit the 400 error with raw path (not normalized)
-        audit_emit(req, req.raw_path, 0, false, t_principal, d, request_id);
+        audit_emit(req, req.raw_path, 0, false, t_principal, d);
         return d;
     }
 
-    // Resolve the principal (API key; F007 adds trusted-proxy precedence)
-    server_auth_principal p = resolve_principal(req);
-    t_principal = p;
-
-    // Classify the route regardless of g_auth_enabled, so a public route
-    // (e.g. /health) never produces an audit line in ANY mode, including
-    // auth-disabled (F006: public routes produce zero audit lines).
+    // Classify the route regardless of g_auth_enabled to determine public vs protected
     bool matched = false;
     uint32_t need = PERM_PUBLIC;
     if (norm_status == NORM_OK) {
@@ -1415,10 +1451,15 @@ server_auth_decision server_auth::authorize_request(const server_auth_request & 
             // norm is only written by normalize_path on NORM_OK; use the raw path
             // for NORM_UNMATCHED so the audit line never logs an empty path.
             const std::string & audit_path = (norm_status == NORM_UNMATCHED) ? req.raw_path : norm;
-            audit_emit(req, audit_path, 0, false, p, d, request_id);
+            audit_emit(req, audit_path, 0, false, server_auth_principal{}, d);
         }
         return d;
     }
+
+    // Auth is enabled beyond this point: resolve principal
+    // Move assign to t_principal, then bind a const ref to avoid a copy.
+    t_principal = resolve_principal(req);
+    const server_auth_principal & p = t_principal;
 
     if (norm_status == NORM_UNMATCHED) {
         // Outside api_prefix: deny by default, require authentication
@@ -1432,7 +1473,7 @@ server_auth_decision server_auth::authorize_request(const server_auth_request & 
         } else {
             d = {true, 200, ERROR_TYPE_PERMISSION, ""};
         }
-        audit_emit(req, req.raw_path, 0, false, p, d, request_id);
+        audit_emit(req, req.raw_path, 0, false, p, d);
         return d;
     }
     // norm_status == NORM_OK below
@@ -1454,14 +1495,14 @@ server_auth_decision server_auth::authorize_request(const server_auth_request & 
         if (g_auth_enabled) {
             g_authn_fail[t_attempted_method][t_fail_reason]++;
         }
-        audit_emit(req, norm, need, matched, p, d, request_id);
+        audit_emit(req, norm, need, matched, p, d);
         return d;
     }
 
     // Unclassified route: authenticated callers can proceed (httplib will 404)
     if (!matched) {
         server_auth_decision d{true, 200, ERROR_TYPE_PERMISSION, ""};
-        audit_emit(req, norm, need, matched, p, d, request_id);
+        audit_emit(req, norm, need, matched, p, d);
         return d;
     }
 
@@ -1480,7 +1521,7 @@ server_auth_decision server_auth::authorize_request(const server_auth_request & 
             }
         }
     }
-    audit_emit(req, norm, need, matched, p, d, request_id);
+    audit_emit(req, norm, need, matched, p, d);
     return d;
 }
 

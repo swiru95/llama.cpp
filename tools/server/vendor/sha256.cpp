@@ -1,8 +1,6 @@
 #include "sha256.h"
 
 #include <cstring>
-#include <iomanip>
-#include <sstream>
 
 // Constants
 static const uint32_t k[64] = {
@@ -83,13 +81,31 @@ void sha256_init(sha256_context * ctx) {
 }
 
 void sha256_update(sha256_context * ctx, const uint8_t * data, size_t len) {
-    for (size_t i = 0; i < len; ++i) {
-        ctx->buf[ctx->buflen++] = data[i];
-        if (ctx->buflen == 64) {
-            sha256_transform(ctx, ctx->buf);
-            ctx->bitlen += 512;
-            ctx->buflen = 0;
+    size_t i = 0;
+    // Fill buffer until it has data (ctx->buflen + (len - i) >= 64)
+    if (ctx->buflen > 0) {
+        size_t fill = 64 - ctx->buflen;
+        if (len < fill) {
+            std::memcpy(ctx->buf + ctx->buflen, data, len);
+            ctx->buflen += len;
+            return;
         }
+        std::memcpy(ctx->buf + ctx->buflen, data, fill);
+        sha256_transform(ctx, ctx->buf);
+        ctx->bitlen += 512;
+        i = fill;
+        ctx->buflen = 0;
+    }
+    // Process whole 64-byte blocks
+    while (len - i >= 64) {
+        sha256_transform(ctx, data + i);
+        ctx->bitlen += 512;
+        i += 64;
+    }
+    // Copy remainder to buffer
+    if (i < len) {
+        std::memcpy(ctx->buf, data + i, len - i);
+        ctx->buflen = len - i;
     }
 }
 
@@ -141,9 +157,11 @@ std::string sha256_hex(const std::string & data) {
     sha256_update(&ctx, reinterpret_cast<const uint8_t *>(data.data()), data.size());
     sha256_final(&ctx, digest);
 
-    std::ostringstream oss;
+    static const char hexdig[] = "0123456789abcdef";
+    char out[64];
     for (int i = 0; i < 32; ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << (int)digest[i];
+        out[i * 2]     = hexdig[(digest[i] >> 4) & 0xf];
+        out[i * 2 + 1] = hexdig[digest[i] & 0xf];
     }
-    return oss.str();
+    return std::string(out, 64);
 }
