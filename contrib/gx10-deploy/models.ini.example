@@ -9,6 +9,21 @@
 # cold cache. Without hf-repo here, a spawned child gets --alias/--ctx-size/
 # --n-gpu-layers but no actual model source, and silently sits idle as an
 # empty router instead of loading or erroring clearly.
+#
+# Check that each hf-repo actually exists before trusting a failure message.
+# A repo that does not exist (or is gated) does NOT report 404: the Hugging
+# Face API answers an anonymous request with
+#   GET failed (401): Invalid username or password
+# because it will not confirm or deny the existence of a private repo to an
+# unauthenticated caller. So a plain typo in a repo name surfaces as what
+# looks exactly like a credentials problem, and sends you hunting for an
+# HF_TOKEN that was never needed. Verify with:
+#   curl -o /dev/null -w '%{http_code}\n' https://huggingface.co/api/models/<owner>/<repo>
+# 200 = exists and is public; 401 = nonexistent, misspelled, or gated.
+#
+# Note in particular that Qwen publishes GGUF conversions for only some of
+# their models - there is no Qwen/Qwen3-Coder-*-GGUF, only third-party
+# conversions such as unsloth's below. Qwen/Qwen3-32B-GGUF is official.
 
 version = 1
 
@@ -16,8 +31,8 @@ version = 1
 ctx-size = 32768
 n-gpu-layers = 999
 
-[Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M]
-hf-repo = Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
+[unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M]
+hf-repo = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
 load-on-startup = true
 
 [Qwen/Qwen3-32B-GGUF:Q4_K_M]
