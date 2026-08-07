@@ -632,6 +632,12 @@ void server_res_spipe::on_complete() {
     if (!spipe || next_finished) {
         return;
     }
+    // F013: the caller's access token expired mid-stream. Do not keep generating on behalf of
+    // an expired principal, and do not leave the partial output discoverable for replay.
+    if (auth_expired) {
+        g_stream_sessions.evict_and_cancel(server_stream_conv_id_from_headers(req->headers));
+        return;
+    }
     // an empty next_orig means set_next() never ran: the request failed before streaming
     // started, typically a params validation throw. evict the session installed by set_req()
     // so the failed request leaves nothing behind for discovery or replay

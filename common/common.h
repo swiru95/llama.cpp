@@ -642,10 +642,34 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
+    std::string config_file = "";        // F012a: --config YAML file path
     std::vector<std::string> api_keys;
+    std::string auth_policy_file = "";   // RBAC policy JSON file path
+    std::string auth_policy_inline = "";  // F012c: inline auth_policy from YAML (JSON string)
+    std::string auth_audit_log = "";     // F006: audit log JSON-lines file path
+    std::string auth_trusted_proxies = ""; // F007: trusted-proxy CIDR list (comma-separated)
+    std::string proxy_allowed_hosts = ""; // F014: /cors-proxy allowlist (target[:portspec] comma-separated)
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT
+
+    std::string mtls_client_ca_file = "";   // F008a: --mtls-client-ca-file
+    std::string mtls_client_ca_dir  = "";   // F008a: --mtls-client-ca-dir
+    std::string mtls_required       = "off";// F008a: --mtls-required {off|optional|required}
+    int         mtls_verify_depth   = 1;    // F008a: --mtls-verify-depth (default 1: leaf-under-issuer)
+    std::string tls_min_version     = "1.2";// F008a: --tls-min-version {1.2|1.3}
+    std::string mtls_crl_file       = "";   // F010a: --mtls-crl-file (PEM CRL bundle; revocation checking)
+    int         mtls_crl_reload_interval = 0; // F016: --mtls-crl-reload-interval (seconds; 0 = disabled)
+
+    std::string oidc_issuer            = "";          // F009a: --oidc-issuer (discovery base)
+    std::string oidc_jwks_url          = "";          // F009a: --oidc-jwks-url (overrides discovery)
+    std::string oidc_audience          = "";          // F009a: --oidc-audience (comma-separated; >=1 required)
+    std::string oidc_algs              = "RS256,ES256";// F009a: --oidc-algs (comma-separated asymmetric algs)
+    std::string oidc_ca_file           = "";          // F009a: --oidc-ca-file (optional CA pin; verify always on)
+    int         oidc_clock_skew        = 60;          // F009a: --oidc-clock-skew seconds (clamped 0..300)
+    std::string oidc_introspection_url = "";          // F010b: --oidc-introspection-url (RFC 7662 endpoint)
+    std::string oidc_client_id         = "";          // F010b: --oidc-client-id (introspection client auth)
+    std::string oidc_client_secret_file= "";          // F010b: --oidc-client-secret-file (secret from FILE)
 
     std::map<std::string, std::string> default_template_kwargs;
 

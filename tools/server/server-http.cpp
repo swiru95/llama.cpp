@@ -2,15 +2,19 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-auth.h"
+#include "server-mtls.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
 
+#include <algorithm>
 #include <functional>
 #include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 //
 // HTTP implementation using cpp-httplib
@@ -104,19 +108,62 @@ bool server_http_context::init(const common_params & params) {
 
     auto & srv = pimpl->srv;
 
+    // F008b: Build and validate mTLS configuration.
+    server_mtls_config mtls_cfg;
+    if (!server_mtls::configure(params, mtls_cfg)) {
+        return false;
+    }
+
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    if (!params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
-        SRV_TRC("running with SSL: key = %s, cert = %s\n", params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
-        srv = std::make_unique<httplib::SSLServer>(
-            params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()
-        );
+    bool has_server_tls = !params.ssl_file_key.empty() && !params.ssl_file_cert.empty();
+
+    // F008b: mTLS requires server cert/key for the TLS listener.
+    if (mtls_cfg.enabled && !has_server_tls) {
+        SRV_ERR("%s", "mTLS requires --ssl-cert-file and --ssl-key-file\n");
+        return false;
+    }
+
+    if (has_server_tls) {
+        SRV_TRC("running with SSL: key = %s, cert = %s\n",
+                params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
+
+        // F008b: Use 4-arg SSLServer ctor if mTLS is enabled, else plain 2-arg.
+        if (mtls_cfg.enabled) {
+            srv = std::make_unique<httplib::SSLServer>(
+                params.ssl_file_cert.c_str(),
+                params.ssl_file_key.c_str(),
+                mtls_cfg.client_ca_file.empty() ? nullptr : mtls_cfg.client_ca_file.c_str(),
+                mtls_cfg.client_ca_dir.empty() ? nullptr : mtls_cfg.client_ca_dir.c_str()
+            );
+        } else {
+            srv = std::make_unique<httplib::SSLServer>(
+                params.ssl_file_cert.c_str(),
+                params.ssl_file_key.c_str()
+            );
+        }
+
+        // F008b: Check SSLServer construction (fail-closed on bad cert/key/CA).
+        if (!srv->is_valid()) {
+            SRV_ERR("%s", "failed to init SSL server (cert/key/CA)\n");
+            return false;
+        }
+
+        // F008b: Harden TLS context on any SSL server (mTLS or plain HTTPS).
+        // This applies min-version to both paths (S2) and verify-depth/optional-mode only when mTLS is enabled.
+        auto ssl_srv = static_cast<httplib::SSLServer *>(srv.get());
+        if (!server_mtls::harden_context(ssl_srv->tls_context(), mtls_cfg)) {
+            SRV_ERR("%s", "failed to harden TLS context\n");
+            return false;
+        }
+
         is_ssl = true;
     } else {
         SRV_TRC("%s", "running without SSL\n");
         srv = std::make_unique<httplib::Server>();
     }
 #else
-    if (params.ssl_file_key != "" && params.ssl_file_cert != "") {
+    // F008b: Fail-closed if SSL is required but not built.
+    if (mtls_cfg.enabled || !params.ssl_file_key.empty() || !params.ssl_file_cert.empty()) {
         SRV_ERR("%s", "the server is built without SSL support\n");
         return false;
     }
@@ -193,62 +240,55 @@ bool server_http_context::init(const common_params & params) {
         return paths;
     }();
 
-    // Public endpoints - API routes plus all embedded UI assets
-    static const std::unordered_set<std::string> get_public_endpoints = []() {
-        std::unordered_set<std::string> endpoints {
-            "/health",
-            "/v1/health",
-            "/models",
-            "/v1/models",
-        };
-        endpoints.insert(frontend_paths.begin(), frontend_paths.end());
-        return endpoints;
-    }();
+    // req.path is prefixed (params.api_prefix + asset path) while frontend_paths
+    // entries are not; strip the prefix before checking membership.
+    auto is_frontend_asset = [&params](const std::string & path) {
+        std::string p = path;
+        if (!params.api_prefix.empty()) {
+            if (p.rfind(params.api_prefix, 0) != 0) {
+                return false;
+            }
+            p = p.substr(params.api_prefix.size());
+            if (p.empty()) {
+                p = "/";
+            }
+        }
+        return frontend_paths.count(p) > 0;
+    };
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
-        // If API key is not set, skip validation
-        if (api_keys.empty()) {
+    auto middleware_authz = [](const httplib::Request & req, httplib::Response & res) {
+        // F005: build auth request DTO
+        server_auth_request ar;
+        ar.method = req.method;
+        ar.raw_path = req.path;
+        ar.authorization = req.get_header_value("Authorization");
+        ar.x_api_key = req.get_header_value("X-Api-Key");
+        ar.peer_addr = req.remote_addr;
+        ar.x_auth_subject = req.get_header_value(server_auth_headers::X_AUTH_SUBJECT);
+        ar.x_auth_roles = req.get_header_value(server_auth_headers::X_AUTH_ROLES);
+
+        // F008c: Extract mTLS identity from the client certificate, if any. req.peer_cert()
+        // is the only public accessor httplib exposes for the peer cert; all SAN parsing and
+        // the C1 ambiguous-SAN handling live in server_mtls::extract_identity (server-mtls.cpp),
+        // this is the single call site.
+#ifdef CPPHTTPLIB_SSL_ENABLED
+        mtls_identity id;
+        auto peer_cert = req.peer_cert();
+        if (server_mtls::extract_identity(&peer_cert, id)) {
+            ar.mtls_present = id.present;
+            ar.mtls_san_uri = id.san_uri;
+            ar.mtls_san_dns = id.san_dns;
+        }
+#endif
+
+        const server_auth_decision d = server_auth::authorize_request(ar);
+        if (d.allowed) {
             return true;
         }
-
-        // If path is public or a UI asset, skip validation
-        if (get_public_endpoints.count(req.path)) {
-            return true;
-        }
-
-        // Check for API key in the Authorization header
-        std::string req_api_key = req.get_header_value("Authorization");
-        if (req_api_key.empty()) {
-            // retry with anthropic header
-            req_api_key = req.get_header_value("X-Api-Key");
-        }
-
-        // remove the "Bearer " prefix if needed
-        static std::string prefix = "Bearer ";
-        if (req_api_key.substr(0, prefix.size()) == prefix) {
-            req_api_key = req_api_key.substr(prefix.size());
-        }
-
-        // validate the API key
-        if (std::find(api_keys.begin(), api_keys.end(), req_api_key) != api_keys.end()) {
-            return true; // API key is valid
-        }
-
-        // API key is invalid or not provided
-        res.status = 401;
+        res.status = d.status;
         res.set_content(
-            safe_json_to_str(json {
-                {"error", {
-                    {"message", "Invalid API Key"},
-                    {"type", "authentication_error"},
-                    {"code", 401}
-                }}
-            }),
-            "application/json; charset=utf-8"
-        );
-
-        SRV_WRN("%s", "unauthorized: Invalid API Key\n");
-
+            safe_json_to_str(json {{"error", format_error_response(d.message, d.type)}}),
+            "application/json; charset=utf-8");
         return false;
     };
 
@@ -276,7 +316,10 @@ bool server_http_context::init(const common_params & params) {
     };
 
     // register server middlewares
-    srv->set_pre_routing_handler([&params, middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
+    srv->set_pre_routing_handler([&params, middleware_authz, middleware_server_state, is_frontend_asset](const httplib::Request & req, httplib::Response & res) {
+        // F005: clear thread_local principal at middleware entry (reset-on-entry)
+        server_auth::reset_principal();
+
         if (params.cors_credentials && params.cors_origins == "*") {
             // special case: echo back the Origin header to allow any origin to access the server with credentials
             res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
@@ -302,7 +345,11 @@ bool server_http_context::init(const common_params & params) {
         if (!middleware_server_state(req, res)) {
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (!middleware_validate_api_key(req, res)) {
+        // UI-asset public carve-out: frontend assets bypass authz
+        if (is_frontend_asset(req.path)) {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+        if (!middleware_authz(req, res)) {
             return httplib::Server::HandlerResponse::Handled;
         }
         return httplib::Server::HandlerResponse::Unhandled;
@@ -516,8 +563,19 @@ static std::map<std::string, std::string> get_params(const httplib::Request & re
 }
 
 static std::map<std::string, std::string> get_headers(const httplib::Request & req) {
+    // F007: Strip identity headers (always, from trusted or untrusted peers).
+    // Single source of truth: server_auth::identity_headers() (see server-auth.h).
+    static const std::unordered_set<std::string> stripped(
+        server_auth::identity_headers().begin(), server_auth::identity_headers().end());
     std::map<std::string, std::string> headers;
     for (const auto & [key, value] : req.headers) {
+        // Case-insensitive header comparison
+        std::string lk = key;
+        std::transform(lk.begin(), lk.end(), lk.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (stripped.count(lk)) {
+            continue;  // skip identity headers
+        }
         headers[key] = value;
     }
     return headers;
@@ -544,13 +602,42 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         response->headers["X-Accel-Buffering"] = "no";
         set_headers(res, response->headers);
         const std::string content_type = response->content_type;
+        // F013: deadline after which no further SSE chunk may be written (0 = never expires)
+        const int64_t auth_deadline = server_auth::stream_deadline(request->principal);
         // convert to shared_ptr as both chunked_content_provider() and on_complete() need to use it
         std::shared_ptr<server_http_req> q_ptr = std::move(request);
         std::shared_ptr<server_http_res> r_ptr = std::move(response);
 
-        const auto chunked_content_provider = [response = r_ptr](size_t, httplib::DataSink & sink) -> bool {
+        const auto chunked_content_provider = [response = r_ptr, auth_deadline](size_t, httplib::DataSink & sink) -> bool {
+            // F013: only SSE responses are gated. In router mode server_http_proxy sets next()
+            // unconditionally, so non-streaming JSON bodies are also "streams" here; writing SSE
+            // framing into those would corrupt them. Producers that are really SSE all set this
+            // content type: server-context.cpp (completions/chat/infill/responses/messages),
+            // server-models.cpp (/models/sse), server-stream.cpp (GET /v1/stream),
+            // server-tools.cpp (tool stream), and the proxy when the child streams.
+            const bool auth_gated = auth_deadline > 0 &&
+                response->content_type.rfind("text/event-stream", 0) == 0;
+            const auto cut = [&]() -> bool {
+                const std::string & chunk = response->sse_expired_chunk.empty()
+                    ? server_auth::sse_expired_chunk_oai()
+                    : response->sse_expired_chunk;
+                sink.write(chunk.data(), chunk.size());
+                sink.done();
+                response->auth_expired = true;
+                SRV_WRN("auth: access token expired mid-stream, terminating stream for %s\n",
+                        response->content_type.c_str());
+                return false;
+            };
+            if (auth_gated && server_auth::stream_expired(auth_deadline)) {
+                return cut();
+            }
             std::string chunk;
             const bool has_next = response->next(chunk);
+            // F013: next() can block for an unbounded time (slot queue, proxy pipe read, tool wait),
+            // so re-check before writing: no byte may cross the deadline (B1).
+            if (auth_gated && server_auth::stream_expired(auth_deadline)) {
+                return cut();
+            }
             if (!chunk.empty()) {
                 if (!sink.write(chunk.data(), chunk.size())) {
                     return false;
@@ -579,6 +666,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
+    registered_routes.emplace_back("GET", path);
     pimpl->srv->Get(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
@@ -587,8 +675,11 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            {}
         });
+        // F005: copy principal from thread_local to request
+        request->principal = server_auth::principal_at_construction();
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     });
@@ -596,6 +687,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
+    registered_routes.emplace_back("POST", path);
     pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
@@ -634,8 +726,11 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            {}
         });
+        // F005: copy principal from thread_local to request
+        request->principal = server_auth::principal_at_construction();
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     });
@@ -643,6 +738,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
+    registered_routes.emplace_back("DELETE", path);
     pimpl->srv->Delete(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
@@ -651,8 +747,11 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            {}
         });
+        // F005: copy principal from thread_local to request
+        request->principal = server_auth::principal_at_construction();
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     });
@@ -715,6 +814,12 @@ void server_http_context::register_gcp_compat() const {
     if (handlers.count(gcp.path_predict)) {
         SRV_ERR("AIP_PREDICT_ROUTE=%s conflicts with an existing llama-server route\n", gcp.path_predict.c_str());
         exit(1);
+    }
+
+    // Register dynamic gcp routes for auth
+    server_auth::register_route("POST", gcp.path_predict, PERM_INFER);
+    if (!gcp.path_health.empty()) {
+        server_auth::register_route("GET", gcp.path_health, PERM_PUBLIC);
     }
 
     // camelCase alias -> canonical path (first registration wins on collision)
@@ -799,6 +904,12 @@ void server_http_context::register_gcp_compat() const {
                         return build_error("no handler registered for @requestFormat: " + format, ERROR_TYPE_INVALID_REQUEST);
                     }
 
+                    // Check that dispatch_path is INFER-only (S1: prevent escalation)
+                    if (!server_auth::is_infer_only(dispatch_path)) {
+                        return build_error("requestFormat not permitted via predict route: " + format,
+                                         ERROR_TYPE_PERMISSION);
+                    }
+
                     const server_http_req internal_req {
                         req.params,
                         req.headers,
@@ -807,6 +918,7 @@ void server_http_context::register_gcp_compat() const {
                         payload.dump(),
                         {},
                         req.should_stop,
+                        req.principal,  // F005: carry outer principal onto async path
                     };
 
                     server_http_res_ptr internal_res = handlers.at(dispatch_path)(internal_req);

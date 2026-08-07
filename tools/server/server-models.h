@@ -337,6 +337,14 @@ struct server_models_routes {
     server_http_context::handler_t router_stream_delete;
 };
 
+// Optional per-proxy overrides. Defaulted so the router call sites (server-models.cpp:1192,
+// :1826) are unchanged. Used by /cors-proxy (F014) to connect only to the IP the SSRF guard
+// validated and to refuse redirects.
+struct server_http_proxy_opts {
+    std::string pinned_ip;             // "" = resolve host normally
+    bool        follow_location = true;
+};
+
 /**
  * A simple HTTP proxy that forwards requests to another server
  * and relays the responses back.
@@ -354,7 +362,8 @@ public:
                       const std::map<std::string, uploaded_file> & files,
                       const std::function<bool()> should_stop,
                       int32_t timeout_read,
-                      int32_t timeout_write
+                      int32_t timeout_write,
+                      const server_http_proxy_opts & opts = {}
                       );
     ~server_http_proxy() {
         if (cleanup) {

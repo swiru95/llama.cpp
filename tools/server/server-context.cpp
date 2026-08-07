@@ -4244,6 +4244,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
+        // F013: dialect-correct chunk used if this stream is cut for token expiry
+        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+            res->sse_expired_chunk = format_anthropic_sse(json {
+                {"event", "error"},
+                {"data",  format_error_response("access token expired", ERROR_TYPE_AUTHENTICATION)},
+            });
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            res->sse_expired_chunk = format_oai_resp_sse(json {
+                {"event", "error"},
+                {"data",  format_error_response("access token expired", ERROR_TYPE_AUTHENTICATION)},
+            });
+        }
         res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {

@@ -1,0 +1,1003 @@
+{
+  "$schema_note": "Feature backlog for the llama-server auth fork. Statuses: todo | in_design | in_progress | in_review | testing | done | blocked. Transitions are made by the agent that owns the gate (see CLAUDE.md): coder may set in_review, reviewer sets testing or bounces back, test-runner sets done. security_sensitive: true requires challenger review in addition to reviewer. Coarse PR2-PR5 entries are refined into small features by the architect before implementation.",
+  "project": "llama-server RBAC + OIDC + mTLS",
+  "plan": "PLAN.md",
+  "stages": [
+    {
+      "id": "PR1",
+      "title": "RBAC core on existing API key",
+      "design_doc": "docs/design/pr1-rbac-core.md"
+    },
+    {
+      "id": "PR2",
+      "title": "Principal propagation, audit log, trusted-proxy mode",
+      "design_doc": "docs/design/pr2-principal-proxy.md"
+    },
+    {
+      "id": "PR3",
+      "title": "mTLS",
+      "design_doc": "docs/design/pr3-mtls.md"
+    },
+    {
+      "id": "PR4",
+      "title": "OIDC",
+      "design_doc": "docs/design/pr4-oidc.md"
+    },
+    {
+      "id": "PR5",
+      "title": "CRL / introspection / WebUI PKCE (optional)",
+      "design_doc": "docs/design/pr5-optional.md"
+    },
+    {
+      "id": "PR6",
+      "title": "General YAML config file",
+      "design_doc": "docs/design/pr6-yaml-config.md"
+    },
+    {
+      "id": "PR7",
+      "title": "Additional hardening (SSRF proxy allowlist, auth metrics, CRL reload)",
+      "design_doc": "docs/design/pr7-additional-hardening.md"
+    }
+  ],
+  "features": [
+    {
+      "id": "F001",
+      "stage": "PR1",
+      "title": "Path normalization",
+      "description": "server_auth::normalize_path over httplib req.path (which is ALREADY single percent-decoded by httplib at parse time, see httplib.cpp:7591). Do NOT decode again and do NOT repair the path. Strip api_prefix (return NORM_UNMATCHED if outside prefix); REJECT (NORM_REJECT->400) any NUL byte, literal '%', backslash, empty segment (double slash), trailing slash (except root), or whole '.'/'..' segment. No slash-collapsing, no trailing-slash-stripping (B1: prevents desync with httplib's PathParamsMatcher which would dispatch POST /slots/ to the ADMIN_STATE /slots/:id_slot handler). Case-sensitive. See docs/design/pr1-rbac-core.md section 5.",
+      "status": "done",
+      "depends_on": [],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr1-rbac-core.md",
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp"
+      ],
+      "acceptance_criteria": [
+        "//slots and /slots/ are REJECTED with HTTP 400 (B1: not silently normalized), so httplib never dispatches the ADMIN_STATE slot handler under a path authz classified differently",
+        "/Slots does not reach the /slots handler; with auth enabled an anonymous request to it is denied (B2), not allowed",
+        "/v1/%2e%2e/slots (-> /v1/../slots) and /slots%00 (-> NUL) are rejected with HTTP 400",
+        "a request whose path lacks the configured api_prefix returns NORM_UNMATCHED and is subject to deny-by-default when auth is enabled (B2)",
+        "an encoded slash %2f decodes (via httplib) to a real separator: /slots%2f0 -> /slots/0 is matched; /slots%2f -> /slots/ is rejected (trailing slash)",
+        "double-encoded sequences leave a literal '%' after httplib's single decode and are rejected, not decoded a second time",
+        "normalization is exercised by black-box HTTP tests (with a key configured) before the middleware is finalized"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_path_normalization.py"
+      ],
+      "notes": "Tests written FIRST (PLAN.md 4.2a). Corrections vs PLAN 4.2a: httplib pre-decodes once (no second decode); and BLOCKER B1 - reject non-canonical paths (double/trailing slash) instead of repairing them, to stay in lockstep with httplib routing.",
+      "done_summary": "PR1 verified: build clean; path-normalization 31/31, security regression 30/30, RBAC blocker regression 1/1; curl matrix incl RBAC admin/user differentiation and B1 bypasses all pass."
+    },
+    {
+      "id": "F002",
+      "stage": "PR1",
+      "title": "Permission model and policy types",
+      "description": "server_perm bitmask (PERM_PUBLIC sentinel + INFER/READ_STATE/METRICS/ADMIN_STATE/ADMIN_MODELS/PROXY), server_auth_principal, and server_auth::init loading policy from --auth-policy-file JSON with a compiled-in default. Roles are named permission sets; api_keys map SHA-256(key) hex -> role; default_role null = deny. Keys hashed with a VENDORED public-domain SHA-256 (works on all builds, no OpenSSL gate); hashed-digest lookup via unordered_map. Three modes: auth-disabled (no policy, no keys), legacy super-user (no policy, keys=PERM_ALL), RBAC (policy present). Adds only --auth-policy-file. See docs/design/pr1-rbac-core.md sections 3,4,8,10.",
+      "status": "done",
+      "depends_on": [],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr1-rbac-core.md",
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp",
+        "tools/server/vendor/ (public-domain sha256)",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/CMakeLists.txt"
+      ],
+      "acceptance_criteria": [
+        "policy file parse error, unknown permission name, or a key mapped to a nonexistent role aborts server startup (fail closed)",
+        "in RBAC mode, a --api-key whose hash is absent from policy.api_keys aborts startup (Q2: policy is the single source of truth, no silent default_role assignment)",
+        "at runtime, a presented key whose hash is unknown and default_role is null is rejected 401 (no default role, no permissive fallback)",
+        "roles and key->role assignments are data (policy JSON), not code: adding a role requires no C++ change",
+        "with no --auth-policy-file and no --api-key, the server behaves exactly as today (open); with no policy and an --api-key set, a valid key grants full access (legacy)",
+        "key hashing uses a vendored SHA-256 and works identically on SSL and non-SSL builds; hashed-digest comparison is a plain unordered_map lookup (C2); consttime_equal retained only for any optional raw-key legacy path"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_authz.py"
+      ],
+      "notes": "Challenger Q1 (vendor SHA-256, no SSL gate), Q2 (--api-key absent from policy = startup error), and C2 (unordered_map lookup for hashed keys) applied.",
+      "done_summary": "PR1 verified: build clean; path-normalization 31/31, security regression 30/30, RBAC blocker regression 1/1; curl matrix incl RBAC admin/user differentiation and B1 bypasses all pass."
+    },
+    {
+      "id": "F003",
+      "stage": "PR1",
+      "title": "Route -> permission table with startup assertion",
+      "description": "Static (method, pattern, perm) table in server-auth.cpp covering every route registered in server.cpp:233-356, matched against normalized concrete paths with ':' segments as single-segment wildcards (mirrors httplib PathParamsMatcher). server_auth::register_route adds env-derived gcp compat paths; server_auth::is_infer_only guards the gcp /predict internal dispatch (S1). METHOD-AWARE startup assertion (S2): a new registered_routes (method,path) vector on server_http_context is populated at get/post/del and assert_routes_covered checks exact (method,pattern) coverage, aborting startup on any gap. Table lives in server-auth.cpp (not server.cpp) per the logic-in-new-files rule; the assertion is the coupling. See docs/design/pr1-rbac-core.md section 6.",
+      "status": "done",
+      "depends_on": [
+        "F002"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr1-rbac-core.md",
+      "files": [
+        "tools/server/server-auth.cpp",
+        "tools/server/server-auth.h",
+        "tools/server/server.cpp",
+        "tools/server/server-http.h",
+        "tools/server/server-http.cpp"
+      ],
+      "acceptance_criteria": [
+        "a (method,path) registered in server.cpp with no exact (method,pattern) table entry aborts startup with a clear SRV_ERR naming method and path (S2: method-aware, not path-only)",
+        "GET /models and /v1/models stay PUBLIC in PR1 (Q3: /models flip deferred; no --auth-public-models flag)",
+        "/health and /v1/health remain public by default",
+        "gcp compat predict/health routes are covered via register_route and pass the assertion in AIP_MODE=PREDICTION; gcp /predict dispatch rejects any @requestFormat that is not INFER-only (S1: no escalation to /props, /slots, /metrics, or router /models)",
+        "router-mode /models, /models/load, /models/unload, /models/sse are classified (ADMIN_MODELS / READ_STATE) and pass the assertion in router mode"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_authz.py"
+      ],
+      "notes": "Deviation from PLAN 4.6 (table in server.cpp) is deliberate; the method-aware assertion (S2) is the rebase safety net that makes new upstream methods/routes fail loudly at startup. Fixes S1 (gcp internal-dispatch escalation) and S2 (method-blind assertion).",
+      "done_summary": "PR1 verified: build clean; path-normalization 31/31, security regression 30/30, RBAC blocker regression 1/1; curl matrix incl RBAC admin/user differentiation and B1 bypasses all pass."
+    },
+    {
+      "id": "F004",
+      "stage": "PR1",
+      "title": "Authn/authz middleware chain on existing API keys",
+      "description": "Replace the middleware_validate_api_key lambda/call (server-http.cpp:208-253, used at :305) with a thin middleware_authz call site that delegates to server_auth::authorize_request(method, req.path, Authorization, X-Api-Key). Keep the OPTIONS short-circuit, middleware_server_state, and the embedded UI-asset (frontend_paths) public carve-out. authorize_request is DENY-BY-DEFAULT when auth is enabled (B2): only auth-disabled mode allows-by-default; an unclassified (path,method) or NORM_UNMATCHED path requires a valid principal (401 for anonymous), then authenticated callers fall through to httplib 404. Decisions: 401 unauthenticated, 403 insufficient perms, 400 malformed path, allow classified+authorized. See docs/design/pr1-rbac-core.md sections 7,8,9.",
+      "status": "done",
+      "depends_on": [
+        "F001",
+        "F002",
+        "F003"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr1-rbac-core.md",
+      "files": [
+        "tools/server/server-http.cpp",
+        "tools/server/server-auth.cpp"
+      ],
+      "acceptance_criteria": [
+        "full route x role x method matrix returns expected status codes (401 unauthenticated with type authentication_error and message 'Invalid API Key'; 403 permission_error when authenticated but under-privileged; 2xx when authorized)",
+        "B2: with auth enabled, an anonymous request to an unclassified (path,method) - e.g. a hypothetical PUT /props - or to a path outside api_prefix, or to a --public-path mount file, returns 401, NOT a silent pass; only auth-disabled mode (no key, no policy) allows-by-default",
+        "key comparison over SHA-256 digests via unordered_map lookup (C2); non-hashed legacy path, if used, is constant-time",
+        "OPTIONS preflight returns CORS headers only and does not reveal route existence (never reaches authz)",
+        "res.status and the JSON body 'code' always agree (both from the same error_type mapping)",
+        "no key, Authorization header, or X-Api-Key value is ever logged",
+        "existing test_security.py assertions (including GET /models public) keep passing unchanged"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_authz.py"
+      ],
+      "notes": "BLOCKER B2 fixed: deny-by-default when auth enabled. PR1 makes the decision entirely inside the middleware; the principal is NOT propagated into server_http_req (that is PR2/F005).",
+      "done_summary": "PR1 verified: build clean; path-normalization 31/31, security regression 30/30, RBAC blocker regression 1/1; curl matrix incl RBAC admin/user differentiation and B1 bypasses all pass."
+    },
+    {
+      "id": "F005",
+      "stage": "PR2",
+      "title": "Principal propagation to handlers",
+      "description": "authorize_request builds a full server_auth_principal {authenticated, subject, issuer, roles[], perms, method, expires_at} (replacing PR1's unused single-role field) and stashes it in a thread_local (server-auth.cpp). reset_principal() is the FIRST line of pre_routing_handler (clear-on-ENTRY, PLAN.md 4.2b) so an early-returning skip path (OPTIONS/503/frontend-asset) cannot leak a prior request's principal on a reused worker thread. get/post/del copy current_principal() into a new server_http_req::principal field (in-class default; assigned after aggregate construction). The gcp /predict internal_req (server-http.cpp:795-803) runs on a std::async worker with NO valid thread_local, so it carries the outer req.principal by value copy. authorize_request signature changes to take a server_auth_request DTO (method, raw_path, authorization, x_api_key, peer_addr, x_auth_subject, x_auth_roles). API-key subject = 'apikey:' + sha256_hex(key).substr(0,12), never the raw key. See docs/design/pr2-principal-proxy.md sections 2,3,4.",
+      "status": "done",
+      "depends_on": [
+        "F004"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr2-principal-proxy.md",
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp",
+        "tools/server/server-http.h",
+        "tools/server/server-http.cpp"
+      ],
+      "acceptance_criteria": [
+        "server_http_req.principal reflects the current request's resolved identity for every route that constructs a server_http_req (get/post/del); API-key requests show method=AUTH_API_KEY and a non-empty subject 'apikey:<12hex>' derived from SHA-256, never the raw key",
+        "no stale principal leaks across requests on a reused worker thread: with --threads-http 1, an authenticated (admin) request followed by an ANONYMOUS request to a PROTECTED route (GET /slots) yields subject_hash=anonymous on the /slots audit line and 401 (thread_local cleared on ENTRY, not exit). Public routes are not audited under 3c so the probe uses /slots, not /health",
+        "the accessor is principal_at_construction() (1c): valid only synchronously at get/post/del construction; handlers read req.principal only, never the accessor (no lazy read during streaming/on_complete/gcp async)",
+        "the gcp /predict internal dispatch (AIP_MODE=PREDICTION) carries the outer request's principal by value copy (async worker has no thread_local); the PR1 S1 is_infer_only guard still rejects non-INFER @requestFormat",
+        "authorize_request takes a server_auth_request DTO and preserves every PR1 decision (auth-disabled allow; anonymous->401 on protected/unclassified/unmatched; authenticated-underprivileged->403; malformed path->400)",
+        "server_auth_principal carries subject/issuer/roles[]/perms/method/expires_at; expires_at is always 0 in PR2 (OIDC populates it in PR4)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_trusted_proxy.py",
+        "tools/server/tests/unit/test_audit.py"
+      ],
+      "reviewer_notes": "Verified against design and PR1 preservation: reset_principal() is the true first statement of pre_routing_handler (before CORS/OPTIONS/state/frontend carve-outs, confirmed by reading server-http.cpp:261-298); principal copied by value into server_http_req at all three get/post/del construction sites and into the gcp internal_req (no thread_local read on the async worker); principal_at_construction() contract documented and not read lazily anywhere. Live-tested (no model, router mode): CIDR/audit fail-closed paths, trusted-proxy allow/deny, and stale-principal-safe entry-clear behavior. One cross-cutting defect found in the same diff (see F006 reviewer_notes) was fixed: an invalid-UTF-8 request path with --auth-audit-log enabled crashed the request to HTTP 500 instead of returning the correct authz decision - fixed by reusing safe_json_to_str (replace-on-invalid-UTF-8) and wrapping audit_emit in try/catch so a hostile path can never alter or fail the request (fail-open restored). No design-level problem found; clean to advance to testing.",
+      "done_summary": "PR2 verified: build clean; full auth regression 81/81 (path 31, authz 1, security 30, trusted-proxy 13, audit 6). Rebase tripwire, /0+malformed-CIDR startup abort, RBAC-via-proxy admin/user differentiation, api-key precedence, audit no-secrets + %0A single-line + invalid-UTF-8 fail-open all green."
+    },
+    {
+      "id": "F006",
+      "stage": "PR2",
+      "title": "Audit log",
+      "description": "Optional JSON-lines stream via --auth-audit-log PATH (env LLAMA_ARG_AUTH_AUDIT_LOG). audit_emit() is called at every authorize_request return site EXCEPT a matched-PERM_PUBLIC allow (3c: /health etc. not audited), writing one line: ts (ISO-8601 UTC), subject_hash (sha256_hex(subject+salt) or 'anonymous'), method, path (normalized; raw on 400), decision (allow/deny), required_perm (perm name or ''), auth_method (none/api_key/trusted_proxy), peer_ip, request_id ('req-'+random_string()). Append mode, no rotation in PR2. Thread-safe via std::mutex; NO per-line flush (3c: rely on ofstream buffering, flush at exit) to avoid a health-poller DoS. Synchronous; write failure drops lines and NEVER fails the request (fail-open). Salt: LLAMA_AUTH_AUDIT_SALT env if set else per-process random_string(); salt never logged. json::dump escapes control chars so a %0A path cannot inject a second line. Unopenable file aborts startup. Opens independently of g_auth_enabled (audit alone does not enable enforcement). MUST NOT log tokens, Authorization/X-Api-Key, raw X-Auth-Subject, prompts, or DNs. See docs/design/pr2-principal-proxy.md sections 5,7.",
+      "status": "done",
+      "depends_on": [
+        "F005"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr2-principal-proxy.md",
+      "files": [
+        "tools/server/server-auth.cpp",
+        "tools/server/server-auth.h",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "tests read the audit file AFTER server.stop() (no per-line flush under 3c); every NON-PUBLIC decision emits exactly one JSON line with all nine fields (ts, subject_hash, method, path, decision, required_perm, auth_method, peer_ip, request_id)",
+        "both allow and deny are logged: user key -> /slots yields one deny line (required_perm=READ_STATE); admin key -> /slots yields one allow line; a 400 malformed path (//slots) yields a deny line",
+        "3c: public routes are NOT audited - a burst of GET /health and GET /v1/health produces zero audit lines",
+        "log-injection safety: a path containing %0A (decodes to a literal newline) still produces a SINGLE JSON line (json::dump escapes it); parsing each physical line yields exactly one JSON object",
+        "grep of the audit file for a configured API key, its Bearer header value, a raw X-Auth-Subject value, and any request-body substring returns nothing",
+        "subject_hash is stable for the same key within one process run and differs from the raw subject; with LLAMA_AUTH_AUDIT_SALT set it is stable across restarts; the salt is never written",
+        "path field is the normalized path on non-400 lines; an unopenable --auth-audit-log path aborts startup; --auth-audit-log alone (no key/policy/proxies) still logs and does NOT enable enforcement"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_audit.py"
+      ],
+      "reviewer_notes": "BLOCKER found and fixed directly: audit_emit() called nlohmann json::dump() with the default strict UTF-8 error handler. A request whose percent-decoded path contains invalid UTF-8 bytes (e.g. GET /%C0%80slots, live-tested) threw a json::type_error inside audit_emit; this propagated out of authorize_request (violating its 'never throws' contract) and out of the pre_routing middleware, turning the correct 401/403/200 decision into an HTTP 500 - and the audit line for that request was lost, contradicting the fail-open requirement and the 'audit must never fail the request' hard rule. Fixed by reusing the existing safe_json_to_str() helper (server-common.cpp, dump with error_handler_t::replace) instead of a raw line.dump() call, and wrapping the whole audit_emit body in try/catch so no future field addition can regress this. Re-tested live: the same request now returns 401 and produces one valid JSON audit line with the invalid bytes replaced. Also fixed a lesser defect: in auth-disabled mode, a NORM_UNMATCHED path (outside api_prefix) was audited with an empty path field because normalize_path only writes out_normalized on NORM_OK; now the raw path is used for the audit line in that case (verified live: /outside-prefix now logs path=/outside-prefix, not empty). Everything else verified clean: request-id/ts/decision/required_perm/auth_method/peer_ip fields exact per design; PERM_PUBLIC matched-allow not audited while non-public health-adjacent unmatched paths still audited per design's 'still audit' rule in auth-disabled mode; no raw subject/roles/keys/headers logged (grepped audit output); salt only from env or per-process random, never logged; unopenable audit path aborts startup (live-tested); no per-line flush, mutex-guarded append confirmed in source.",
+      "done_summary": "PR2 verified: build clean; full auth regression 81/81 (path 31, authz 1, security 30, trusted-proxy 13, audit 6). Rebase tripwire, /0+malformed-CIDR startup abort, RBAC-via-proxy admin/user differentiation, api-key precedence, audit no-secrets + %0A single-line + invalid-UTF-8 fail-open all green."
+    },
+    {
+      "id": "F007",
+      "stage": "PR2",
+      "title": "Trusted-proxy mode (variant B)",
+      "description": "--auth-trusted-proxies CIDR[,...] (env LLAMA_ARG_AUTH_TRUSTED_PROXIES), IPv4+IPv6, parsed via inet_pton into {family,net[16],bits}; malformed CIDR aborts startup; a /0 all-peers entry is REJECTED at init (2c). resolve_principal precedence (PR2 subset of mTLS->OIDC->proxy-headers->API-key): if peer_is_trusted(req.remote_addr) AND X-Auth-Subject present, build an AUTH_TRUSTED_PROXY principal with subject=X-Auth-Subject, roles=split_csv(X-Auth-Roles) mapped to perms via the persisted policy role table g_role_perms (unknown roles contribute no perms -> fail-closed 403); else fall through to API-key auth. Q4: p.roles keeps raw client role names for audit only; authorization is ONLY on p.perms, never role names. 4b: init MUST change the PR1 early return to `!has_api_keys && !has_trusted_proxies` so trusted-proxy-only mode still builds g_role_perms and sets g_auth_enabled true. peer_is_trusted returns false when no CIDR is configured or the peer is unix/empty/hostname; handles IPv4-mapped ::ffff: peers; 127.0.0.1 and ::1 are distinct families. INVARIANT (Q2): req.remote_addr is the genuine TCP peer only because llama-server never calls httplib set_trusted_proxies - guarded by a required pytest rebase tripwire. HARD RULE: X-Auth-Subject/X-Auth-Roles/X-Forwarded-Client-Cert are ALWAYS stripped in get_headers() (case-insensitive) so handlers/MCP never see them, trusted or not; the middleware is the only reader and gates on peer. Setting --auth-trusted-proxies ENABLES enforcement (Q5). X-Forwarded-Client-Cert is stripped only (consumed in PR3). See docs/design/pr2-principal-proxy.md sections 6,8.",
+      "status": "done",
+      "depends_on": [
+        "F005"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr2-principal-proxy.md",
+      "files": [
+        "tools/server/server-auth.cpp",
+        "tools/server/server-auth.h",
+        "tools/server/server-http.cpp",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "identity headers from a NON-listed peer are ignored and stripped: with --auth-trusted-proxies 10.0.0.0/8, a loopback request carrying X-Auth-Subject/X-Auth-Roles:admin gets no admin access (falls back to API-key auth; POST /slots -> 401/403) and audit auth_method is not trusted_proxy",
+        "identity headers from a LISTED peer produce an authenticated principal with mapped roles: with --auth-trusted-proxies 127.0.0.0/8, a loopback request with X-Auth-Subject:ops, X-Auth-Roles:admin can POST /slots/0 (ADMIN_STATE) with no API key; audit shows auth_method=trusted_proxy",
+        "REBASE TRIPWIRE (Q2, REQUIRED - do not mark done without it): with --auth-trusted-proxies set to a DIFFERENT host's IP, a request from the non-listed test client sending X-Forwarded-For:<that IP> + X-Auth-Roles:admin still gets 401/403 on POST /slots/0 and audit auth_method is not trusted_proxy (catches a future rebase that lets httplib rewrite remote_addr from X-Forwarded-For)",
+        "4b: trusted-proxy-only mode (no --api-key, no --auth-policy-file, only --auth-trusted-proxies 127.0.0.0/8) enforces deny-by-default and maps X-Auth-Roles:admin to the compiled-in admin perm set (g_role_perms populated, g_auth_enabled true)",
+        "X-Auth-Roles listing only an unknown role -> authenticated but 403 on a protected route (perms=0); authorization is on perms, never role names",
+        "with NO --auth-trusted-proxies configured, identity headers are always ignored/stripped (loopback client with X-Auth-Roles:admin still 401/403 on /slots)",
+        "IPv6: ::1/128 trusts an IPv6 loopback peer; a v4-mapped ::ffff:127.0.0.1 peer matches a 127.0.0.0/8 v4 CIDR; a malformed CIDR AND an all-peers /0 (0.0.0.0/0 or ::/0) both abort startup (2c)",
+        "X-Auth-Subject/X-Auth-Roles/X-Forwarded-Client-Cert never reach a handler or the MCP proxy header map; trusted-proxy mode is unusable over a unix-socket listener (peer has no IP)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_trusted_proxy.py"
+      ],
+      "reviewer_notes": "No implementation defects found in the F007-specific code (init's 4b fix, CIDR parse incl. /0 rejection and stoi-exception handling, peer_is_trusted, v4-mapped stripping, resolve_principal precedence and unknown-role fail-closed perms=0, get_headers case-insensitive strip of X-Auth-Subject/X-Auth-Roles/X-Forwarded-Client-Cert). Live-verified: malformed CIDR and 0.0.0.0/0 and ::/0 abort startup; trusted-proxy-only mode (no keys/policy) enforces deny-by-default (anonymous GET /slots -> 401) and maps X-Auth-Roles:admin via the compiled-in role table (reached the handler, i.e. authorized) while an unknown-role-only header set gets 403; identity headers from a non-listed peer (127.0.0.0/8 configured, 10.0.0.0/8 required) are ignored, falling back to anonymous/401. req.remote_addr invariant (Q2) confirmed by grep: server-http.cpp/server.cpp never call httplib set_trusted_proxies; the required pytest rebase-tripwire test itself is test-planner/test-runner scope, not yet executed - flagging so it is not skipped when tests are written. Depends on F005's principal plumbing and F006's audit fix, both verified above; no separate F007 defect.",
+      "done_summary": "PR2 verified: build clean; full auth regression 81/81 (path 31, authz 1, security 30, trusted-proxy 13, audit 6). Rebase tripwire, /0+malformed-CIDR startup abort, RBAC-via-proxy admin/user differentiation, api-key precedence, audit no-secrets + %0A single-line + invalid-UTF-8 fail-open all green."
+    },
+    {
+      "id": "F008a",
+      "stage": "PR3",
+      "title": "mTLS CLI flags, params, and test-harness threading",
+      "description": "Add five common_params fields near ssl_file_cert/ssl_file_key (common.h:650-651) and five CLI flags following the --ssl-cert-file pattern (arg.cpp:3408-3421): --mtls-client-ca-file (LLAMA_ARG_MTLS_CLIENT_CA_FILE), --mtls-client-ca-dir (LLAMA_ARG_MTLS_CLIENT_CA_DIR), --mtls-required {off|optional|required} default off (LLAMA_ARG_MTLS_REQUIRED), --mtls-verify-depth N default 1 (C5: SPIFFE leaf-under-issuer; LLAMA_ARG_MTLS_VERIFY_DEPTH, std::stoi), --tls-min-version {1.2|1.3} default 1.2 (LLAMA_ARG_TLS_MIN_VERSION). Setters store raw strings/int only; validation is deferred to server_mtls::configure (F008b). Flag help must state: optional/required ENABLE deny-by-default enforcement and need an --auth-policy-file mtls.role_map to authorize any client; CRL/OCSP not implemented (use short-lived certs); CA paths are not secrets. Thread all five flags into ServerProcess (utils.py) mirroring auth_policy_file; if ServerProcess lacks ssl_file_cert/ssl_file_key wiring, add it too (needed by test_mtls.py). See docs/design/pr3-mtls.md sections 7, 10.",
+      "status": "done",
+      "depends_on": [
+        "F005"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr3-mtls.md",
+      "files": [
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "all five flags parse and set their common_params fields; --mtls-required default is 'off', --tls-min-version default '1.2', --mtls-verify-depth default 1 (C5)",
+        "flag help documents C2 (SAN role_map keys are matched byte-exact, no percent-decode/case-fold/trailing-dot) and C3 (a trailing '*' is a raw byte prefix, not segment-bounded; include the trailing delimiter and map wildcards to least privilege)",
+        "each flag has its LLAMA_ARG_* env var and is scoped to LLAMA_EXAMPLE_SERVER",
+        "flag help for --mtls-required documents that optional/required enable enforcement and require an --auth-policy-file mtls.role_map, and that CRL is not implemented (short-lived certs recommended)",
+        "ServerProcess appends each set flag to server_args (mirroring auth_policy_file); ssl_file_cert/ssl_file_key threading exists (added if absent) so test_mtls.py can start an HTTPS server",
+        "no secret is passed on argv (only paths, an enum string, an int, and a version string)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "reviewer_notes": "No defects found in this feature's own files. common.h/arg.cpp: all five flags present with correct defaults, LLAMA_ARG_* env vars, LLAMA_EXAMPLE_SERVER scoping, and help text covering C2/C3/CRL-not-implemented/not-a-secret. utils.py: ssl_file_cert/ssl_file_key plus all five mtls_* fields threaded into ServerProcess and server_args mirroring auth_policy_file. Live-verified fail-closed startup for unknown --mtls-required and --tls-min-version values (see F008b notes). Reviewed together with F008b-d as one PR3 diff; the defects found (see F008c/F008d notes) were in server-mtls.cpp/server-http.cpp, not here.",
+      "done_summary": "PR3 mTLS verified: build clean (LLAMA_OPENSSL on+off); full auth regression 103 passed + 1 xfailed (mtls 19+1xfail, path 31, authz 4, security 30, trusted-proxy 13, audit 6). Cert boundary challenger-cleared: single extraction path, C1 ambiguous-SAN deny, embedded-NUL safe, wildcard boundary, S1 invariant, verify modes, mTLS-first precedence, fail-closed startup."
+    },
+    {
+      "id": "F008b",
+      "stage": "PR3",
+      "title": "mTLS TLS-context: SSLServer client-CA construction + SSL_CTX hardening + build gating",
+      "description": "New file pair server-mtls.{h,cpp}. server_mtls::configure(params, out) builds and validates a server_mtls_config {enabled, require_cert, client_ca_file, client_ca_dir, verify_depth, min_tls_version} from the F008a flags: off->disabled (CA files ignored with a warning); optional->enabled,require_cert=false; required->enabled,require_cert=true; optional/required require a CA file or dir else fail; unknown --mtls-required or --tls-min-version, or negative verify-depth, fail (fail closed, never throws). configure ALWAYS populates cfg.min_tls_version even when mode==off (S2). server_mtls::harden_context(void* ctx, cfg) applies to ANY SSL server (mTLS or plain): casts tls_context() (NOT ssl_context() - see design discrepancy table) to SSL_CTX* under CPPHTTPLIB_OPENSSL_SUPPORT, ALWAYS sets SSL_CTX_set_min_proto_version, and ONLY when cfg.enabled sets SSL_CTX_set_verify_depth plus (optional mode) re-sets SSL_VERIFY_PEER WITHOUT SSL_VERIFY_FAIL_IF_NO_PEER_CERT; returns false without OpenSSL (fail closed). server-http.cpp:108-127 SSL construction is extended: build cfg via configure (return false on failure); when mtls enabled use the 4-arg SSLServer(cert,key,ca_file,ca_dir) (httplib sets SSL_VERIFY_PEER|FAIL_IF_NO_PEER_CERT) else the 2-arg plain SSLServer, check srv->is_valid(), then call harden_context via static_cast<httplib::SSLServer*>(srv.get())->tls_context() on BOTH SSL paths (S2: so --tls-min-version applies to plain HTTPS, which httplib otherwise hardcodes to TLS1.2 at httplib.cpp:13298); mtls enabled without server cert/key => refuse start; no-SSL build with any mtls/ssl flag => refuse start. server-mtls.h stays OpenSSL-free (void* handles); OpenSSL include is inside CPPHTTPLIB_OPENSSL_SUPPORT in the .cpp only. Add server-mtls.cpp/.h to CMakeLists llama-server-impl. See docs/design/pr3-mtls.md section 3, 11.",
+      "status": "done",
+      "depends_on": [
+        "F008a"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr3-mtls.md",
+      "files": [
+        "tools/server/server-mtls.h",
+        "tools/server/server-mtls.cpp",
+        "tools/server/CMakeLists.txt",
+        "tools/server/server-http.cpp"
+      ],
+      "acceptance_criteria": [
+        "required mode: a client presenting no cert is rejected at the TLS handshake (transport error), not with an HTTP status",
+        "a client cert from a different CA, and an expired cert signed by the good CA, are rejected at the handshake in BOTH optional and required mode (SSL_VERIFY_PEER verifies any presented cert; only cert ABSENCE is tolerated in optional)",
+        "--mtls-required optional/required without --ssl-cert-file/--ssl-key-file aborts startup; without a client CA file or dir aborts startup; an unknown --mtls-required or --tls-min-version value, or a negative --mtls-verify-depth, aborts startup",
+        "on a build without SSL support, setting any mtls or ssl flag aborts startup",
+        "harden_context always sets the min proto version (1.2 or 1.3) and, only when mTLS is enabled, sets the verify depth and (optional mode) drops FAIL_IF_NO_PEER_CERT so a cert-less client completes the handshake; srv->is_valid() is checked and a bad cert/key/CA path aborts startup",
+        "S2: --tls-min-version applies to a PLAIN HTTPS server too (no mTLS): --ssl-cert-file with --tls-min-version 1.3 rejects a TLS-1.2-only client (harden_context is called on the plain-TLS SSLServer path, not only the mTLS path)",
+        "server-mtls.h includes no OpenSSL headers (handles are void*); server-http.cpp/server-auth.cpp gain no OpenSSL include"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "reviewer_notes": "configure()/harden_context() match the design and are fail-closed: live-verified startup aborts (exit 1, correct SRV_ERR) for unknown --mtls-required, unknown --tls-min-version, required-mode-no-CA, required-mode-no-server-cert, and a full no-SSL cmake build (LLAMA_OPENSSL=OFF) compiles cleanly and would refuse to start on any mtls/ssl flag per the #else branch (code-reviewed; the actual runtime abort in that configuration was not re-run after the fix, only the compile). harden_context correctly applies min-version unconditionally and verify-depth/optional-override only when cfg.enabled, matching S2. One defect found and fixed here (see F008c notes for detail, it lives in server-mtls.cpp touched by this feature too): the header-include guard bug that made CPPHTTPLIB_SSL_ENABLED-gated code permanently dead in server-mtls.cpp. Fixed by including httplib.h unconditionally instead of guarding it on the very macro it defines. srv->is_valid() check and 4-arg/2-arg SSLServer selection in server-http.cpp verified correct by reading and by a full live TLS handshake matrix (see F008d notes).",
+      "done_summary": "PR3 mTLS verified: build clean (LLAMA_OPENSSL on+off); full auth regression 103 passed + 1 xfailed (mtls 19+1xfail, path 31, authz 4, security 30, trusted-proxy 13, audit 6). Cert boundary challenger-cleared: single extraction path, C1 ambiguous-SAN deny, embedded-NUL safe, wildcard boundary, S1 invariant, verify modes, mTLS-first precedence, fail-closed startup."
+    },
+    {
+      "id": "F008c",
+      "stage": "PR3",
+      "title": "mTLS client-certificate identity extraction into the auth DTO",
+      "description": "server_mtls::extract_identity(const void* ssl_session, mtls_identity& out) extracts SAN URI (first) then SAN DNS (first), never CN, from the already-chain-verified peer cert. Uses the vendored httplib backend-agnostic abstraction httplib::tls::get_peer_cert_from_session(req.ssl) -> PeerCert::sans() (SanType::URI/DNS), gated on CPPHTTPLIB_SSL_ENABLED (design discrepancy: Request.ssl is tls::const_session_t/const void*, NOT SSL*; there is no manual GENERAL_NAMES walk). C1: SAN order is cert-author-controlled, so extract counts each selected type and, if MORE THAN ONE URI (or DNS) SAN is present, leaves that identity field EMPTY (ambiguous -> fail-closed -> perms=0 -> 403); exactly-one -> that value. mtls_identity {present, san_uri, san_dns} carries NO cn/DN field (PII). Returns false (out.present=false) when there is no TLS session or no peer cert (optional mode). Add three fields to server_auth_request (mtls_present, mtls_san_uri, mtls_san_dns) with defaults so existing DTO construction compiles. In server-http.cpp middleware_authz (215-235), after the existing DTO assignments and inside #ifdef CPPHTTPLIB_SSL_ENABLED, call extract_identity(req.ssl, id) and copy id.* into ar.mtls_*. No cert parsing in server-http.cpp. See docs/design/pr3-mtls.md section 4.",
+      "status": "done",
+      "depends_on": [
+        "F008b"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr3-mtls.md",
+      "files": [
+        "tools/server/server-mtls.h",
+        "tools/server/server-mtls.cpp",
+        "tools/server/server-auth.h",
+        "tools/server/server-http.cpp"
+      ],
+      "acceptance_criteria": [
+        "a request with a valid client cert populates ar.mtls_present=true and ar.mtls_san_uri (and ar.mtls_san_dns when a DNS SAN is present); CN is never read",
+        "C1: a cert carrying two or more URI SANs (or two or more DNS SANs) leaves that identity field EMPTY (present=true but san_uri/san_dns empty) so the identity is treated as ambiguous and denied downstream, not resolved to the first SAN",
+        "a request with no TLS session or no peer cert (optional mode, no cert) leaves ar.mtls_present=false and the SAN fields empty",
+        "mtls_identity carries no CN/DN field; extraction reads only SANs from the verified cert and does not re-verify the chain",
+        "server-auth.h server_auth_request gains mtls_present/mtls_san_uri/mtls_san_dns with in-class defaults so existing construction still compiles",
+        "the only server-http.cpp change is the extract_identity call site inside #ifdef CPPHTTPLIB_SSL_ENABLED; no X.509 parsing lives in server-http.cpp"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "reviewer_notes": "TWO real defects found and fixed directly (not the coder's stated reasons, which were incorrect diagnoses of a genuine compile/logic bug): (1) the coder bypassed server_mtls::extract_identity entirely and re-implemented SAN extraction plus the C1 ambiguous-SAN counting inline in server-http.cpp's middleware_authz using req.peer_cert(), leaving extract_identity dead code, and did so with NO #ifdef guard at all around the httplib::tls types/req.peer_cert() call - this would fail to compile on a no-SSL build (confirmed: a from-scratch cmake -DLLAMA_OPENSSL=OFF build of the original code would not compile server-http.cpp). (2) investigating why the coder felt forced to bypass extract_identity, found the ACTUAL root cause: server-mtls.cpp guarded its `#include \"vendor/cpp-httplib/httplib.h\"` on `#ifdef CPPHTTPLIB_SSL_ENABLED`, but that macro is defined *inside* httplib.h itself (derived from CPPHTTPLIB_OPENSSL_SUPPORT/MBEDTLS/WOLFSSL) - it is never defined before this guard runs, so the include (and therefore extract_identity's entire CPPHTTPLIB_SSL_ENABLED-gated body) was permanently compiled out on every build, making extract_identity silently and permanently return present=false regardless of build configuration. Live-confirmed with debug tracing on a full OpenSSL build before the fix: extract_ret=0 on every request despite a valid, verified client cert being presented (curl handshake showed Certificate/CertVerify/Finished exchanged). Separately, ALSO found that even after fixing the include guard, `httplib::tls::get_peer_cert_from_session()` is not actually reachable via qualified lookup from outside httplib.cpp (declared only as a `friend` inside the PeerCert class, not as an ordinary namespace-scope declaration) - so the design's exact API (extract_identity(req.ssl, ...) calling get_peer_cert_from_session internally) does not compile at all; httplib.cpp itself only gets away with using it because the friend definition at file scope in that one .cpp also serves as its own declaration for later use in the same file. FIX: changed extract_identity's contract to take the address of a httplib::tls::PeerCert already obtained by the caller via the one truly public accessor, req.peer_cert(); server-mtls.h stays free of httplib/OpenSSL types (still void*), all SAN parsing and the C1 counting logic remain the single implementation in server-mtls.cpp, and server-http.cpp's middleware now has exactly one #ifdef CPPHTTPLIB_SSL_ENABLED-gated call site (req.peer_cert() + server_mtls::extract_identity(&peer_cert, id)) instead of duplicated logic. Folded this correction back into docs/design/pr3-mtls.md section 4.2/4.4 (design doc now matches the shipped code and documents why the original API assumption does not compile). Also fixed a stale `(void) ssl_session;` in the #else branch left over from the parameter rename (would not compile on a no-SSL build). Verified after the fix: (a) full OpenSSL build clean, 0 warnings; (b) a from-scratch `cmake -DLLAMA_OPENSSL=OFF` build of llama-server-impl compiles cleanly (confirms the fail-closed no-SSL path is real, not just designed); (c) live TLS handshake with a generated CA/client-cert matrix - admin cert to POST /slots/0 succeeds (no 401/403), user cert 403 on /slots/0 and 200 on /completion, unmapped-SAN cert 403, C1 cert carrying two URI SANs (one of them admin-mapped) 403 not first-wins-200, required mode with no client cert fails at the TLS handshake (curl exit 56, no HTTP response). No X.509/SAN parsing added to server-http.cpp; the only mTLS-specific code there is obtaining the PeerCert and delegating to server-mtls.cpp.",
+      "done_summary": "PR3 mTLS verified: build clean (LLAMA_OPENSSL on+off); full auth regression 103 passed + 1 xfailed (mtls 19+1xfail, path 31, authz 4, security 30, trusted-proxy 13, audit 6). Cert boundary challenger-cleared: single extraction path, C1 ambiguous-SAN deny, embedded-NUL safe, wildcard boundary, S1 invariant, verify modes, mTLS-first precedence, fail-closed startup."
+    },
+    {
+      "id": "F008d",
+      "stage": "PR3",
+      "title": "mTLS SAN->role policy mapping and resolve_principal precedence",
+      "description": "Add AUTH_MTLS to server_auth_method (after AUTH_TRUSTED_PROXY, stable values) and AUTH_MTLS->\"mtls\" to auth_method_to_string (server-auth.cpp:377). Parse an optional policy mtls object in server_auth::init after g_role_perms is persisted (server-auth.cpp:698): identity_source (\"san_uri\" default | \"san_dns\", else fail), role_map (SAN pattern -> existing role name, else fail); a pattern is exact or trailing-wildcard prefix* (a single trailing *; * elsewhere fails). Store g_mtls_identity_source and g_mtls_role_map. init gating: has_mtls = (mtls_required==optional||required); extend the PR2 auth-disabled early return to also require !has_mtls (server-auth.cpp:646); g_auth_enabled |= has_mtls (658) so enabling mTLS enables enforcement and builds default roles. S1 defensive invariant (MANDATORY, do not rely on the two-line coupling): as the LAST check before init returns success, if (has_mtls && !g_auth_enabled) { SRV_ERR; return false; } so a half-applied edit cannot leave mTLS enabled while enforcement is off (fail-open of the PR2-4b class). mtls_lookup(identity): exact match wins, else longest-prefix wildcard; empty identity never matches. resolve_principal (server-auth.cpp:783) gets a NEW first branch (precedence mTLS -> trusted-proxy -> API key -> anonymous): if req.mtls_present, pick identity per g_mtls_identity_source, build AUTH_MTLS principal authenticated=true, issuer=\"mtls\", subject=identity, perms from mtls_lookup (unmapped or empty identity -> perms=0 -> caller 403, no default role, no fallback to API key). Authorization stays on p.perms only (F007 Q4). subject_hash in audit is sha256(subject+salt), so the raw SAN/DN is never logged. See docs/design/pr3-mtls.md sections 5, 6.",
+      "status": "done",
+      "depends_on": [
+        "F008c"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr3-mtls.md",
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp"
+      ],
+      "acceptance_criteria": [
+        "a valid client cert whose SAN maps to admin can POST /slots/0 (ADMIN_STATE) with no API key; audit shows auth_method=mtls and a non-anonymous subject_hash",
+        "a valid client cert whose SAN maps to user succeeds on POST /completions (INFER) and gets 403 on POST /slots/0 (ADMIN_STATE)",
+        "a valid client cert with an UNMAPPED SAN is authenticated but perms=0 -> 403 on any protected route (no default role, no fallback to API-key auth)",
+        "optional mode with no cert but a valid API key falls through to API-key auth (POST /completions succeeds); optional mode with no cert and no key -> 401 on a protected route",
+        "exact SAN match wins over a wildcard; the spiffe://corp/ns/* wildcard maps a longer SAN to user; a role_map entry naming a nonexistent role, a bad identity_source, or a misplaced '*' aborts startup",
+        "precedence is mTLS -> trusted-proxy -> API key -> anonymous; enabling mTLS (optional/required) sets g_auth_enabled and builds the compiled-in admin/user roles even with no policy file; authorization is on p.perms only, never role names or the raw SAN",
+        "S1: init refuses to start (returns false) if has_mtls is true but g_auth_enabled is false (defensive invariant against a half-applied enforcement-flip coupling)",
+        "S1 regression: mTLS-only mode (--mtls-required optional, no --api-key, no --auth-policy-file, no --auth-trusted-proxies), a request with NO client cert and NO key to a protected route returns 401, never 200 (server must not silently allow-all)",
+        "the raw SAN/DN is never written to the audit log (only its salted hash); issuer is the constant \"mtls\", not the CA DN"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "reviewer_notes": "No defects found in server-auth.cpp/h itself (the F008c fix in server-mtls.cpp/server-http.cpp was required before this code could be exercised at all). Verified by reading and by live testing: S1 invariant is all three pieces (early-return guard extended with !has_mtls at line 657, g_auth_enabled OR-ing has_mtls at line 669, AND the final defensive `if (has_mtls && !g_auth_enabled) return false` at line 849) and g_role_perms/compiled-in admin+user roles are built in mTLS-only mode (has_policy_file false, has_mtls true falls to the 'else' branch, not the auth-disabled early return). mtls_lookup's wildcard match is a genuine raw-byte prefix on pattern-minus-trailing-'*' (server-auth.cpp ~line 906: `prefix = pattern.substr(0, pattern.size()-1); identity.substr(0, prefix.size()) == prefix`) - live-tested with role_map {\"spiffe://corp/ns/ml/sa/ops\":\"admin\", \"spiffe://corp/ns/*\":\"user\"} and a boundary cert SAN spiffe://corp/nsEVIL: got HTTP 403 on POST /completion, i.e. the wildcard (whose prefix INCLUDES the trailing slash 'spiffe://corp/ns/') correctly does NOT match 'nsEVIL' at the differing 17th byte ('/' vs 'E'). The coder's own claim that this wildcard matches nsEVIL was a misstatement, not a real bug - the implementation is correct raw-byte-prefix semantics per design C3. resolve_principal's mTLS branch is the first check (server-auth.cpp ~line 929), reads only req.mtls_present/mtls_san_uri/mtls_san_dns (never x_auth_subject/x_auth_roles), and returns immediately on req.mtls_present with no fallthrough to trusted-proxy/API-key on the same request (OQ6 confirmed live: a cert-bearing client with an unmapped SAN plus a simultaneously valid Authorization: Bearer API key still got 403, not 200). Identity headers (X-Auth-Subject/Roles/X-Forwarded-Client-Cert) remain stripped in get_headers regardless of mTLS (unchanged PR2 code, re-verified present). Audit line for mtls requests: auth_method='mtls', subject_hash is a salted sha256 hex digest (never the raw SAN), issuer constant 'mtls' - confirmed by grepping a live audit log for 'spiffe://' (zero matches) across allow and deny lines. Live-verified acceptance-criteria matrix on a generated CA + 6 client certs (admin/user/unmapped/two-URI-ambiguous/wildcard-boundary) against a real TLS handshake: admin cert authorized on ADMIN_STATE and METRICS routes, user cert 200 on INFER / 403 on ADMIN_STATE, unmapped-SAN cert 403, C1 two-URI-SAN cert 403 (not first-wins), required-mode no-cert rejected at the TLS handshake (not HTTP), optional-mode no-cert-with-valid-key falls through to API-key auth and succeeds, optional-mode no-cert-no-key 401, S1 mTLS-only-mode no-cert-no-key 401. Startup fail-closed matrix live-verified (exit 1 in every case): bad mtls.identity_source, '*' in the middle of a role_map pattern, role_map naming a nonexistent role, unknown --mtls-required, unknown --tls-min-version, required mode without a CA, required mode without a server cert/key. Full existing regression suite re-run after all fixes: 54/54 passed (test_authz.py, test_path_normalization.py, test_trusted_proxy.py, test_audit.py) - no PR1/PR2 regression. Build: clean, 0 warnings, both with OpenSSL (LLAMA_OPENSSL=ON, default) and without (a from-scratch LLAMA_OPENSSL=OFF configure+build of llama-server-impl was run specifically to validate the F008c fix's #ifdef correctness). Per CLAUDE.md, mTLS identity extraction and policy decisions are security-sensitive and still require challenger review of the implementation (the existing 'challenger reviewed this design' note in pr3-mtls.md section 13 covers the DESIGN only, not this code, and the extraction-path/wildcard-boundary defects found here were introduced during implementation, after that design review) - flagging for the pending challenger pass on the cert boundary.",
+      "done_summary": "PR3 mTLS verified: build clean (LLAMA_OPENSSL on+off); full auth regression 103 passed + 1 xfailed (mtls 19+1xfail, path 31, authz 4, security 30, trusted-proxy 13, audit 6). Cert boundary challenger-cleared: single extraction path, C1 ambiguous-SAN deny, embedded-NUL safe, wildcard boundary, S1 invariant, verify modes, mTLS-first precedence, fail-closed startup."
+    },
+    {
+      "id": "F009",
+      "stage": "PR4",
+      "title": "OIDC JWT validation (umbrella - refined into F009a-F009d)",
+      "description": "Local access-token (JWT) validation with jwt-cpp, resource-server only (no auth-code flow, no sessions/cookies). Refined by the architect into F009a (vendor jwt-cpp + CMake + flags/params + server-oidc skeleton), F009b (JWKS discovery/fetch/cache + rate-limited refresh), F009c (JWT verification core: alg whitelist + none/HS rejection + sig/iss/aud/exp/nbf/iat/typ), F009d (roles-claim + policy oidc parse + resolve_principal branch + init enforcement-flip). Work the sub-features, not this umbrella. PLAN.md 4.4; docs/design/pr4-oidc.md.",
+      "status": "done",
+      "depends_on": [
+        "F004",
+        "F005"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr4-oidc.md",
+      "files": [
+        "tools/server/server-oidc.h",
+        "tools/server/server-oidc.cpp",
+        "tools/server/vendor/jwt-cpp/",
+        "common/arg.cpp",
+        "tools/server/CMakeLists.txt"
+      ],
+      "acceptance_criteria": [
+        "tracked via F009a-F009d; this umbrella is done only when all four are done"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "done_summary": "Umbrella closed: F009a-F009d all done. OIDC hardening pass (S-1/S-2/C-1/C-2/C-4) applied directly in server-oidc.cpp after challenger cleared the design/implementation boundary with NO blocker (35/35 test_oidc.py + 138 passed/1 xfailed full regression at the time of that review). Four non-blocking findings fixed: (S-1) expiry-triggered JWKS refresh had no backoff against a down IdP - every validate() past TTL expiry re-entered refresh_jwks() (a blocking 5s HTTPS GET under g_jwks_mtx) on every request; fixed by anchoring jwks_cache.last_refresh on the ATTEMPT (not just success, matching the design doc's own field comment) and gating the expiry-refresh branch in jwks_get_key on a new g_jwks_refresh_min_interval (default 30s, test-overridable via LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS), fail-static preserved between attempts. (S-2) the 1 MiB JWKS/discovery body cap was checked AFTER the whole body was buffered in https_get - fixed by calling httplib's own cli.set_payload_max_length(1 MiB) before the GET, which aborts the read mid-stream once the cap is exceeded (verified via httplib.cpp: send_() returns res=nullptr on abort, so the existing !res check already treats it as a fetch failure); applies to every https_get call site (discovery + jwks fetch + refetch) since they share the one helper. (C-1) Cache-Control max-age was applied verbatim with no ceiling (a compromised IdP could pin keys for ~31 years via max-age=999999999); fixed by clamping in get_cache_ttl to a new g_jwks_ttl_ceiling (default 86400s/24h, test-overridable via LLAMA_OIDC_JWKS_TTL_CEILING_SECONDS), applied to both the response max-age and the fallback TTL. (C-2) discovery did not verify the discovery doc's 'issuer' field matched --oidc-issuer (OIDC Discovery mandates this); fixed by failing init closed on a missing/mismatched issuer field, checked before jwks_uri is ever used. (C-4, trivial) looks_like_jwt tightened to reject '=' anywhere (real unpadded JWT segments never contain it), now [A-Za-z0-9_-] only. Added 4 new regression tests to test_oidc.py, reusing the existing mock-IdP fixture: test_s1_expiry_refresh_bounded_hits_against_down_idp (burst of 6 requests past TTL expiry against a down IdP yields at most 1 outbound JWKS hit, fail-static preserved throughout), test_s2_oversized_jwks_response_fails_closed_at_boot (2 MiB JWKS body over the 1 MiB cap -> mandatory initial fetch fails -> server refuses to start, fail-closed), test_c1_max_age_ceiling_clamps_runaway_cache_control (max-age=999999999 clamped to a 1s test ceiling; the unknown-kid refresh path is deliberately 'burned' on a throwaway kid first so it cannot confound the result - the rotated kid2 becoming reachable is attributable only to the TTL-expiry path, proving the clamp actually shortened the TTL), test_c2_discovery_issuer_mismatch_fails_startup (discovery doc issuer != --oidc-issuer -> server refuses to start). Rebuilt both LLAMA_OPENSSL=ON and LLAMA_OPENSSL=OFF: both exit 0, zero new warnings (only the twelve pre-existing vendored jwt-cpp header warnings remain, same as before this pass, not introduced here). Full unit/test_oidc.py run: 39/39 passed (35 pre-existing + 4 new) in a clean 41.94s run; one earlier full-suite run under heavy machine load produced 2 transient timeouts (including test_unknown_kid_rejected, a pre-existing test untouched by this change) that did not reproduce on rerun and passed individually in isolation - confirmed as environmental flakiness, not a defect introduced by this hardening pass."
+    },
+    {
+      "id": "F009a",
+      "stage": "PR4",
+      "title": "Vendor jwt-cpp + CMake wiring + OIDC flags/params + server-oidc skeleton",
+      "description": "Vendor jwt-cpp (header-only, MIT) at tools/server/vendor/jwt-cpp/ (NOT repo-root vendor/ - repo convention is tools/server/vendor/, alongside sha256; nlohmann/json is reachable as <nlohmann/json.hpp> via common's ../vendor PUBLIC include). Configure jwt-cpp for nlohmann traits: in server-oidc.cpp #define JWT_DISABLE_PICOJSON, then #include <jwt-cpp/traits/nlohmann-json/traits.h> and <jwt-cpp/jwt.h>, using jwt::traits::nlohmann_json. Add server-oidc.cpp/.h to llama-server-impl and add target_include_directories PRIVATE vendor/jwt-cpp/include; NO new link libs (OpenSSL is transitive via cpp-httplib); NO LLAMA_SERVER_OIDC option (mTLS set the precedent: gate on CPPHTTPLIB_OPENSSL_SUPPORT at compile time and on flags at run time). Add six common_params fields (oidc_issuer, oidc_jwks_url, oidc_audience, oidc_algs default 'RS256,ES256', oidc_ca_file, oidc_clock_skew default 60) near common.h:646-657 and six CLI flags following the --auth-policy-file/--mtls-* pattern (arg.cpp:3374-3466), each set_examples LLAMA_EXAMPLE_SERVER with LLAMA_ARG_OIDC_* env vars; help must state resource-server-only, verification-always-on, --oidc-ca-file optional pin, none/HS* rejected, and that setting --oidc-issuer or --oidc-jwks-url enables deny-by-default enforcement. server-oidc.h declares the full contract (oidc_validation struct + configured/init/validate/looks_like_jwt); F009a IMPLEMENTS configured() (pure param check) and looks_like_jwt() (three non-empty base64url segments), and stubs init()/validate() to fail-closed (init returns false when configured, validate returns ok=false) until F009b/c. Thread the six flags into ServerProcess (utils.py) mirroring auth_policy_file. server-oidc.h stays free of jwt-cpp/OpenSSL/httplib types (claims cross as a JSON string). See docs/design/pr4-oidc.md sections 2, 3, 6.",
+      "status": "done",
+      "depends_on": [
+        "F008d"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr4-oidc.md",
+      "files": [
+        "tools/server/vendor/jwt-cpp/",
+        "tools/server/CMakeLists.txt",
+        "tools/server/server-oidc.h",
+        "tools/server/server-oidc.cpp",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "jwt-cpp is vendored header-only under tools/server/vendor/jwt-cpp/ with its upstream LICENSE file; the pinned tag ships traits/nlohmann-json/traits.h and compiles with JWT_DISABLE_PICOJSON against the vendored nlohmann/json.hpp (no picojson pulled in) on both LLAMA_OPENSSL=ON and OFF configurations (OQ1)",
+        "all six flags parse and set their common_params fields with correct defaults (oidc_algs 'RS256,ES256', oidc_clock_skew 60, others empty); each has its LLAMA_ARG_OIDC_* env var scoped to LLAMA_EXAMPLE_SERVER; no secret is passed on argv",
+        "server_oidc::configured returns true iff --oidc-issuer or --oidc-jwks-url is set, and is safe to call on a no-OpenSSL build",
+        "server_oidc::looks_like_jwt returns true only for exactly three non-empty base64url-charset ('.'-separated) segments; false for opaque strings, two-segment, empty-segment, or non-base64url tokens",
+        "init()/validate() stubs are fail-closed (init returns false when configured; validate returns ok=false) so the tree builds and links before F009b/c land",
+        "server-oidc.h includes no jwt-cpp/OpenSSL/httplib headers; ServerProcess appends each set oidc_* flag to server_args mirroring auth_policy_file",
+        "flag help documents resource-server-only (no auth-code flow/sessions), verification-always-on with optional --oidc-ca-file pin, none/HS* rejection, and the deny-by-default enforcement flip"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "reviewer_notes": "Reviewed together with F009b/c/d as one PR4 diff (jwt-cpp API confirmed real by grepping the vendored header: jwt::helper::create_public_key_from_rsa_components/create_public_key_from_ec_components, jwt::jwk<traits>::get_jwk_claim, jwt::parse_jwks all exist in the vendored tree at the exact signatures the coder used; LICENSE file present). server-oidc.h matches the design contract verbatim (no jwt-cpp/OpenSSL/httplib types cross the header). CMakeLists.txt wiring matches design exactly: sources added, target_include_directories PRIVATE vendor/jwt-cpp/include, no new link libs, no LLAMA_SERVER_OIDC option. common.h/arg.cpp: all six flags present with correct defaults and LLAMA_ARG_OIDC_* env vars scoped to LLAMA_EXAMPLE_SERVER; help text covers resource-server-only, none/HS* rejection, optional CA pin with verification always on, and the enforcement-flip and JWT-vs-API-key routing caveat (C2). utils.py threads all six oidc_* fields into ServerProcess/server_args mirroring auth_policy_file. Two defects found in server-oidc.cpp (shared by all F009a-d sub-features since it is one file) were fixed directly during this review; see F009b/F009c/F009d reviewer_notes for the itemized list (Cache-Control TTL never read, discovery URL not https-checked/size-capped, CA file applied after the first HTTPS call in discovery mode, unguarded std::stoi on the S4 test-only env vars, and two new compiler warnings introduced by this file - missing-prototype on a free-linkage helper and an unused dead static variable). Rebuilt both LLAMA_OPENSSL=ON and OFF after the fixes: both exit 0, zero NEW warnings (only pre-existing vendored jwt-cpp header warnings remain, e.g. -Wextra-semi/-Wcast-qual in tools/server/vendor/jwt-cpp/include, not introduced by this PR and not in scope to fix). Advancing to testing; per CLAUDE.md this is security-sensitive code (JWT/JWKS handling) and still needs the pending challenger pass noted in F009 (see F009d reviewer_notes). | Challenger cleared this implementation with NO blocker on the crypto/identity boundary; four non-blocking hardening findings (S-1/S-2/C-1/C-2, +C-4 trivial) applied directly by the reviewer post-clearance, see done_summary.",
+      "done_summary": "OIDC hardening pass (S-1/S-2/C-1/C-2/C-4) applied directly in server-oidc.cpp after challenger cleared the design/implementation boundary with NO blocker (35/35 test_oidc.py + 138 passed/1 xfailed full regression at the time of that review). Four non-blocking findings fixed: (S-1) expiry-triggered JWKS refresh had no backoff against a down IdP - every validate() past TTL expiry re-entered refresh_jwks() (a blocking 5s HTTPS GET under g_jwks_mtx) on every request; fixed by anchoring jwks_cache.last_refresh on the ATTEMPT (not just success, matching the design doc's own field comment) and gating the expiry-refresh branch in jwks_get_key on a new g_jwks_refresh_min_interval (default 30s, test-overridable via LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS), fail-static preserved between attempts. (S-2) the 1 MiB JWKS/discovery body cap was checked AFTER the whole body was buffered in https_get - fixed by calling httplib's own cli.set_payload_max_length(1 MiB) before the GET, which aborts the read mid-stream once the cap is exceeded (verified via httplib.cpp: send_() returns res=nullptr on abort, so the existing !res check already treats it as a fetch failure); applies to every https_get call site (discovery + jwks fetch + refetch) since they share the one helper. (C-1) Cache-Control max-age was applied verbatim with no ceiling (a compromised IdP could pin keys for ~31 years via max-age=999999999); fixed by clamping in get_cache_ttl to a new g_jwks_ttl_ceiling (default 86400s/24h, test-overridable via LLAMA_OIDC_JWKS_TTL_CEILING_SECONDS), applied to both the response max-age and the fallback TTL. (C-2) discovery did not verify the discovery doc's 'issuer' field matched --oidc-issuer (OIDC Discovery mandates this); fixed by failing init closed on a missing/mismatched issuer field, checked before jwks_uri is ever used. (C-4, trivial) looks_like_jwt tightened to reject '=' anywhere (real unpadded JWT segments never contain it), now [A-Za-z0-9_-] only. Added 4 new regression tests to test_oidc.py, reusing the existing mock-IdP fixture: test_s1_expiry_refresh_bounded_hits_against_down_idp (burst of 6 requests past TTL expiry against a down IdP yields at most 1 outbound JWKS hit, fail-static preserved throughout), test_s2_oversized_jwks_response_fails_closed_at_boot (2 MiB JWKS body over the 1 MiB cap -> mandatory initial fetch fails -> server refuses to start, fail-closed), test_c1_max_age_ceiling_clamps_runaway_cache_control (max-age=999999999 clamped to a 1s test ceiling; the unknown-kid refresh path is deliberately 'burned' on a throwaway kid first so it cannot confound the result - the rotated kid2 becoming reachable is attributable only to the TTL-expiry path, proving the clamp actually shortened the TTL), test_c2_discovery_issuer_mismatch_fails_startup (discovery doc issuer != --oidc-issuer -> server refuses to start). Rebuilt both LLAMA_OPENSSL=ON and LLAMA_OPENSSL=OFF: both exit 0, zero new warnings (only the twelve pre-existing vendored jwt-cpp header warnings remain, same as before this pass, not introduced here). Full unit/test_oidc.py run: 39/39 passed (35 pre-existing + 4 new) in a clean 41.94s run; one earlier full-suite run under heavy machine load produced 2 transient timeouts (including test_unknown_kid_rejected, a pre-existing test untouched by this change) that did not reproduce on rerun and passed individually in isolation - confirmed as environmental flakiness, not a defect introduced by this hardening pass."
+    },
+    {
+      "id": "F009b",
+      "stage": "PR4",
+      "title": "OIDC JWKS discovery, HTTPS fetch, cache, and rate-limited refresh",
+      "description": "Implement server_oidc::init config resolution and the JWKS cache in server-oidc.cpp, all under #ifdef CPPHTTPLIB_OPENSSL_SUPPORT (no-OpenSSL: init returns false when configured). init: no-op+true when not configured; parse oidc_algs into a set (only RS256/384/512, ES256/384/512 allowed; none or HS* -> fail; empty -> default RS256,ES256); parse oidc_audience via the split helper (>=1 required, else fail); clamp oidc_clock_skew to [0,300] (>300 -> fail); resolve g_jwks_url: --oidc-jwks-url wins, else DISCOVERY GET {issuer trimmed of trailing '/'}/.well-known/openid-configuration and read jwks_uri (required string; malformed/failed discovery -> fail); the JWKS and discovery URLs MUST be https (http -> fail, stricter than common_http_client); then a MANDATORY initial JWKS fetch (fail -> return false; PLAN 4.2c). HTTP client: reuse common_http_client(url) from common/http.h; for https call enable_server_certificate_verification(true) (never disabled) and set_ca_cert_path(oidc_ca_file) only when the CA path is set (else system store). Cache (mutex g_jwks_mtx): {raw_jwks JSON string fed to jwt-cpp, set<string> kids, expires_at, last_refresh, last_unknown_kid_refresh}. refresh_jwks(): on success replace raw_jwks+kids and set expires_at=now+ttl (ttl from Cache-Control max-age>0 else fallback 300s); on failure KEEP the existing cache (fail-STATIC), SRV_WRN, return false; a non-200/non-JSON/zero-key response is a failure. jwks_get_key(kid): if now>=expires_at attempt single-flight refresh (keep stale on failure); if kid known return the key (jwt-cpp JWK->key, see F009c); if kid unknown do at most one refresh per (300 + jitter 0..30)s window anchored on last_unknown_kid_refresh, then re-check; still unknown -> none. No background thread (lazy request-path refresh only). See docs/design/pr4-oidc.md sections 4.1, 4.2.",
+      "status": "done",
+      "depends_on": [
+        "F009a"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr4-oidc.md",
+      "files": [
+        "tools/server/server-oidc.cpp",
+        "tools/server/server-oidc.h"
+      ],
+      "reviewer_notes": "THREE defects found and fixed directly in server-oidc.cpp. (1) BLOCKER vs explicit acceptance criterion: get_cache_ttl() never read the response at all - its own comment said 'For now, we use the fallback TTL since we don't have response headers' - so Cache-Control: max-age was silently ignored on every refresh, always falling back to the 300s default regardless of what the IdP advertised. Fixed by extracting a shared https_get() helper (used by both the JWKS fetch and discovery) that reads res->get_header_value(\"Cache-Control\"), parses max-age=<n>, and threads it through fetch_jwks()/refresh_jwks() into get_cache_ttl(max_age_from_response); a missing/malformed/<=0 header still falls back to g_jwks_ttl_fallback, matching the design exactly. (2) BLOCKER vs explicit acceptance criterion ('an http:// (non-https) JWKS or discovery URL ... makes init return false'): the DISCOVERY GET (built from --oidc-issuer, not --oidc-jwks-url) had no https-scheme check before firing - only the final resolved g_jwks_url was checked at line ~438 (after discovery already ran). An --oidc-issuer of http://... would perform a plain-HTTP discovery request with no TLS, no verification, silently bypassing the https-only fail-closed rule (S1-adjacent: discovery response tampering / SSRF-adjacent path). Also, unlike the JWKS fetch, the discovery GET had no S5 response body size cap. Both are fixed by routing discovery through the same new https_get() helper, which enforces the https-only prefix check and the 1 MiB cap before either request type executes. Live-verified: --oidc-issuer http://localhost:18443 now aborts startup (exit 1) with 'OIDC: refusing non-https URL' / 'OIDC: discovery failed' instead of silently making a plain HTTP request. (3) Functional bug found while fixing (2): g_oidc_ca_file was assigned from params AFTER the discovery block ran ('Step 6: CA file' came after 'Step 4: Resolve JWKS URL' in the original code), so an --oidc-ca-file pin was never applied to the discovery request - only to the subsequent JWKS fetch. Fixed by moving the CA-file assignment before JWKS-URL resolution. Live end-to-end regression-tested this exact fix: started llama-server in DISCOVERY mode (--oidc-issuer only, no --oidc-jwks-url) against a mock IdP on a self-signed CA passed via --oidc-ca-file; server started successfully (JWKS fetched via discovery using the pinned CA) - this would have failed closed (refused to start, CA not trusted by system store) before the fix. Also fixed: the S4 test-only env var parsing (LLAMA_OIDC_JWKS_TTL_SECONDS / LLAMA_OIDC_UNKNOWN_KID_WINDOW_SECONDS) called std::stoi unguarded, which throws std::invalid_argument on a malformed value - violating both the design's 'malformed value is ignored, keep the default' rule and server_oidc::init's documented 'never throws' contract; wrapped in try/catch, default preserved on parse failure. Two dead code / build-hygiene issues also fixed (compiler-confirmed via a full rebuild before/after): jwks_get_key had external linkage with no header declaration, triggering -Wmissing-prototypes; made it static (internal linkage, matches its actual internal-only usage). An unused static bool g_oidc_require_typ_setter (leftover cruft, never read or written meaningfully) triggered -Wunused-variable; removed. Rebuilt both LLAMA_OPENSSL=ON and OFF after all fixes: exit 0, and the 'building server-oidc.cpp' compile step is now free of any warning from this file (only pre-existing vendored jwt-cpp header warnings remain, out of scope). Everything else verified clean by reading: alg parsing (RS256/384/512, ES256/384/512 only; none/HS* rejected before the allowlist check), audience parsing (>=1 required), clock-skew clamp [0,300], --oidc-issuer always required (C1) even with --oidc-jwks-url set, S1 set_follow_location(false) present on every fetch path (both before and after this fix), S5 timeouts present, S3 jwks_get_key returns std::optional<std::string> by value (verified no reference/iterator into the cache escapes the mutex), unknown-kid rate limiting matches the design formula (window + jitter 0..30s, anchored on last_unknown_kid_refresh, single-flight under g_jwks_mtx), no-OpenSSL stub returns false when configured. Full acceptance-criteria matrix live-verified end to end (see F009d reviewer_notes for the full smoke-test transcript, which exercises both jwks-url-explicit and issuer-only-discovery modes). | Challenger cleared this implementation with NO blocker on the crypto/identity boundary; four non-blocking hardening findings (S-1/S-2/C-1/C-2, +C-4 trivial) applied directly by the reviewer post-clearance, see done_summary.",
+      "acceptance_criteria": [
+        "with only --oidc-issuer set, init discovers the JWKS endpoint from /.well-known/openid-configuration; with --oidc-jwks-url set it is used directly and discovery is skipped",
+        "an http:// (non-https) JWKS or discovery URL, a discovery response lacking jwks_uri, a bad alg in --oidc-algs, an empty --oidc-audience, a clock-skew > 300, or an empty --oidc-issuer (C1: required even when --oidc-jwks-url is set) makes init return false (server aborts, fail closed)",
+        "the JWKS HTTPS client always has server-certificate verification enabled; --oidc-ca-file pins the CA when set and the system store is used when unset; verification is never disableable",
+        "S1: the JWKS/discovery client sets set_follow_location(false); an endpoint that 302-redirects to http:// or to another host is NOT followed and is treated as a fetch failure (no SSRF/downgrade)",
+        "S5: the client sets short connection AND read timeouts and a response body size cap; an IdP that accepts TCP but never responds makes init fail within the timeout (no boot hang), and an oversize body is a fetch failure",
+        "a MANDATORY initial JWKS fetch runs in init: an unreachable IdP at startup makes init return false and the server does not start (PLAN 4.2c)",
+        "TTL is taken from Cache-Control max-age when present and >0, else the fallback (default 300s); on IdP-unreachable at runtime the cache keeps last-known keys (fail-static) and does not clear them",
+        "S4: the fallback TTL and the unknown-kid window are overridable via the test-only env vars LLAMA_OIDC_JWKS_TTL_SECONDS / LLAMA_OIDC_UNKNOWN_KID_WINDOW_SECONDS (read only in init, not --flags), so key-rotation and runtime fail-static are CI-exercisable in seconds",
+        "S3: jwks_get_key returns the public-key PEM BY VALUE (std::optional<std::string>), never a reference/iterator into the cache, so a concurrent refresh cannot invalidate a key mid-verify",
+        "an unknown kid triggers at most one JWKS refetch per window (default ~5 min, +0..30s jitter); a burst of distinct unknown kids does not exceed that rate (DoS-amplification guard); refresh is single-flight under g_jwks_mtx",
+        "on a no-OpenSSL build with OIDC configured, init returns false (fail closed)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "done_summary": "OIDC hardening pass (S-1/S-2/C-1/C-2/C-4) applied directly in server-oidc.cpp after challenger cleared the design/implementation boundary with NO blocker (35/35 test_oidc.py + 138 passed/1 xfailed full regression at the time of that review). Four non-blocking findings fixed: (S-1) expiry-triggered JWKS refresh had no backoff against a down IdP - every validate() past TTL expiry re-entered refresh_jwks() (a blocking 5s HTTPS GET under g_jwks_mtx) on every request; fixed by anchoring jwks_cache.last_refresh on the ATTEMPT (not just success, matching the design doc's own field comment) and gating the expiry-refresh branch in jwks_get_key on a new g_jwks_refresh_min_interval (default 30s, test-overridable via LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS), fail-static preserved between attempts. (S-2) the 1 MiB JWKS/discovery body cap was checked AFTER the whole body was buffered in https_get - fixed by calling httplib's own cli.set_payload_max_length(1 MiB) before the GET, which aborts the read mid-stream once the cap is exceeded (verified via httplib.cpp: send_() returns res=nullptr on abort, so the existing !res check already treats it as a fetch failure); applies to every https_get call site (discovery + jwks fetch + refetch) since they share the one helper. (C-1) Cache-Control max-age was applied verbatim with no ceiling (a compromised IdP could pin keys for ~31 years via max-age=999999999); fixed by clamping in get_cache_ttl to a new g_jwks_ttl_ceiling (default 86400s/24h, test-overridable via LLAMA_OIDC_JWKS_TTL_CEILING_SECONDS), applied to both the response max-age and the fallback TTL. (C-2) discovery did not verify the discovery doc's 'issuer' field matched --oidc-issuer (OIDC Discovery mandates this); fixed by failing init closed on a missing/mismatched issuer field, checked before jwks_uri is ever used. (C-4, trivial) looks_like_jwt tightened to reject '=' anywhere (real unpadded JWT segments never contain it), now [A-Za-z0-9_-] only. Added 4 new regression tests to test_oidc.py, reusing the existing mock-IdP fixture: test_s1_expiry_refresh_bounded_hits_against_down_idp (burst of 6 requests past TTL expiry against a down IdP yields at most 1 outbound JWKS hit, fail-static preserved throughout), test_s2_oversized_jwks_response_fails_closed_at_boot (2 MiB JWKS body over the 1 MiB cap -> mandatory initial fetch fails -> server refuses to start, fail-closed), test_c1_max_age_ceiling_clamps_runaway_cache_control (max-age=999999999 clamped to a 1s test ceiling; the unknown-kid refresh path is deliberately 'burned' on a throwaway kid first so it cannot confound the result - the rotated kid2 becoming reachable is attributable only to the TTL-expiry path, proving the clamp actually shortened the TTL), test_c2_discovery_issuer_mismatch_fails_startup (discovery doc issuer != --oidc-issuer -> server refuses to start). Rebuilt both LLAMA_OPENSSL=ON and LLAMA_OPENSSL=OFF: both exit 0, zero new warnings (only the twelve pre-existing vendored jwt-cpp header warnings remain, same as before this pass, not introduced here). Full unit/test_oidc.py run: 39/39 passed (35 pre-existing + 4 new) in a clean 41.94s run; one earlier full-suite run under heavy machine load produced 2 transient timeouts (including test_unknown_kid_rejected, a pre-existing test untouched by this change) that did not reproduce on rerun and passed individually in isolation - confirmed as environmental flakiness, not a defect introduced by this hardening pass."
+    },
+    {
+      "id": "F009c",
+      "stage": "PR4",
+      "title": "OIDC JWT verification core (alg whitelist, signature, iss/aud/exp/nbf/iat, typ)",
+      "description": "Implement server_oidc::validate in a fixed, testable order under #ifdef CPPHTTPLIB_OPENSSL_SUPPORT (else return ok=false). Split of responsibility: OUR code enforces shape, the alg whitelist + none/HS* rejection, kid resolution, aud containment, and optional typ; jwt-cpp enforces signature, iss (with_issuer), and exp/nbf/iat with leeway. Order: (1) looks_like_jwt shape check; (2) jwt::decode<traits> (any throw -> deny); (3) read header alg+kid (missing alg or kid -> deny); (4) ALG WHITELIST: reject 'none', reject any 'HS*' (a JWKS public key must never be used as an HMAC secret - algorithm confusion), and require alg in g_oidc_algs; (5) jwks_get_key(kid) (rate-limited refresh on miss, from F009b) -> deny on unknown kid; (6) build a jwt::verify<traits> that allow_algorithm ONLY the single asymmetric verifier for the header alg using the public key from the JWK (NEVER an HMAC verifier), .leeway(g_oidc_clock_skew), and .with_issuer(g_oidc_issuer) when non-empty; verifier.verify(decoded) (throws -> deny); (7) AUDIENCE containment (OURS): the token aud (string or array) must contain >=1 configured audience, else deny; (8) optional typ: when g_oidc_require_at_jwt_typ (set via server_oidc::set_require_typ, called by server-auth), require header typ=='at+jwt'; (9) fill subject(sub; missing->deny), issuer(verified g_oidc_issuer), expires_at(exp as unix seconds; missing exp->deny), claims_json(jwt-cpp get_payload()). Use jwt-cpp helpers to turn a JWK into the asymmetric key; do NOT build an EVP_PKEY by hand; a JWK jwt-cpp cannot turn into a key is treated as unknown-kid (fail closed). error strings are short and NEVER contain the token. Add set_require_typ(bool) to the interface. See docs/design/pr4-oidc.md sections 4.3, 4.4.",
+      "status": "done",
+      "depends_on": [
+        "F009b"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr4-oidc.md",
+      "files": [
+        "tools/server/server-oidc.cpp",
+        "tools/server/server-oidc.h"
+      ],
+      "reviewer_notes": "No defects specific to validate() itself; it matches the design's fixed order exactly (shape -> decode -> alg+kid extraction -> alg whitelist reject none/HS* before key lookup -> jwks_get_key -> pinned 6-way switch -> verifier.verify -> aud containment -> optional typ -> fill sub/iss/exp/claims_json), all inside one try/catch that maps any jwt-cpp throw to ok=false/error='verify failed' (no fail-open path: every early return sets v.error and returns v with ok still false). S2 pinned-verifier confirmed by reading: the switch on `alg` is exhaustive over exactly RS256/384/512/ES256/384/512, each branch constructs exactly one jwt::algorithm::rsXXX{pem,...}/esXXX{pem,...}, there is no default/fallthrough that could reach a generic or HMAC verifier, and the alg whitelist (step 4, reject none/HS*, require membership in g_oidc_algs) runs strictly BEFORE jwks_get_key and the switch - so an HS256 token can never reach key lookup, let alone have the RSA PEM handed to an HMAC verifier. jwk_to_pem (F009b, shared code) correctly rejects kty=='oct' outright (returns nullopt, never even attempts a key build) and RSA/EC-vs-wrong-alg-family mismatches fail at PEM/verifier construction time inside the outer try/catch (caught, denied) - confirmed this is genuine fail-closed behavior, not merely 'probably throws'. End-to-end live-verified (see F009d reviewer_notes for the full transcript): alg=none -> 401, hand-crafted HS256 token signed with the RSA public-key bytes as the HMAC secret -> 401 (the single most important negative case per the design's test-strategy section), a 2-segment malformed token -> 401, a valid bare-JWK (no x5c) RS256 token -> 200 with correct role mapping. Clock-skew/leeway is applied uniformly via .leeway(g_oidc_clock_skew) to exp/nbf/iat per jwt-cpp's verifier semantics (not independently re-implemented, so no drift between the three checks). Audience containment is OUR code (not jwt-cpp with_audience), matches decoded.get_audience() (a set<string> that jwt-cpp normalizes from either a JSON string or array aud claim) intersected against g_oidc_audiences - confirmed via jwt.h grep that get_audience() returns basic_claim_t::set_t. error strings (\"malformed\", \"no alg\", \"no kid\", \"alg not allowed\", \"unknown kid\", \"verify failed\", \"aud mismatch\", \"typ mismatch\", \"no sub\", \"no exp\") are all short constants; grepped server-auth.cpp's call site and confirmed v.error is never logged, audited, or otherwise surfaced - only v.subject (via the existing salted-hash audit path) and v.expires_at/v.claims_json (used internally, never logged) leave server_oidc. No changes made to this sub-feature's own logic; the fixes recorded under F009b were in shared JWKS-cache/init code this function depends on. | Challenger cleared this implementation with NO blocker on the crypto/identity boundary; four non-blocking hardening findings (S-1/S-2/C-1/C-2, +C-4 trivial) applied directly by the reviewer post-clearance, see done_summary.",
+      "acceptance_criteria": [
+        "a token with alg 'none' is rejected (ok=false), and an HS256 token signed with the JWKS RSA public key as the HMAC secret is rejected (algorithm confusion): validate never constructs an HMAC verifier",
+        "S2: the verifier is an explicit 6-way switch (RS256/384/512 -> jwt::algorithm::rsXXX{pem,...}, ES256/384/512 -> esXXX{pem,...}); the PEM is obtained via jwt::parse_jwks(raw).get_jwk(kid) + a jwt-cpp public-key helper (no hand-built EVP_PKEY); no hsXXX/none/generic verifier is ever constructed",
+        "S2: a kid resolving to an oct (symmetric) JWK, an RSA JWK used with an ES* alg, or an EC JWK used with an RS* alg is rejected (treated as unknown-kid/verify-failure, fail closed); no HMAC path is reachable",
+        "a token whose alg is not in --oidc-algs, or whose kid is unknown after a rate-limited refresh, is rejected",
+        "a token with a bad signature, wrong iss, expired exp, or future nbf (beyond clock-skew) is rejected; a token exactly within clock-skew of exp/nbf is accepted",
+        "a token whose aud does not contain any configured audience is rejected; a token missing exp or missing sub is rejected",
+        "when require_at_jwt_typ is set, a token whose header typ != 'at+jwt' is rejected; when unset, typ is not checked",
+        "on success oidc_validation carries sub, the verified iss, exp as unix seconds, and the payload claims_json; error strings never contain the token",
+        "the JWK->public-key conversion uses jwt-cpp helpers only (no hand-built EVP_PKEY); a malformed JWK is treated as unknown-kid (fail closed)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "done_summary": "OIDC hardening pass (S-1/S-2/C-1/C-2/C-4) applied directly in server-oidc.cpp after challenger cleared the design/implementation boundary with NO blocker (35/35 test_oidc.py + 138 passed/1 xfailed full regression at the time of that review). Four non-blocking findings fixed: (S-1) expiry-triggered JWKS refresh had no backoff against a down IdP - every validate() past TTL expiry re-entered refresh_jwks() (a blocking 5s HTTPS GET under g_jwks_mtx) on every request; fixed by anchoring jwks_cache.last_refresh on the ATTEMPT (not just success, matching the design doc's own field comment) and gating the expiry-refresh branch in jwks_get_key on a new g_jwks_refresh_min_interval (default 30s, test-overridable via LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS), fail-static preserved between attempts. (S-2) the 1 MiB JWKS/discovery body cap was checked AFTER the whole body was buffered in https_get - fixed by calling httplib's own cli.set_payload_max_length(1 MiB) before the GET, which aborts the read mid-stream once the cap is exceeded (verified via httplib.cpp: send_() returns res=nullptr on abort, so the existing !res check already treats it as a fetch failure); applies to every https_get call site (discovery + jwks fetch + refetch) since they share the one helper. (C-1) Cache-Control max-age was applied verbatim with no ceiling (a compromised IdP could pin keys for ~31 years via max-age=999999999); fixed by clamping in get_cache_ttl to a new g_jwks_ttl_ceiling (default 86400s/24h, test-overridable via LLAMA_OIDC_JWKS_TTL_CEILING_SECONDS), applied to both the response max-age and the fallback TTL. (C-2) discovery did not verify the discovery doc's 'issuer' field matched --oidc-issuer (OIDC Discovery mandates this); fixed by failing init closed on a missing/mismatched issuer field, checked before jwks_uri is ever used. (C-4, trivial) looks_like_jwt tightened to reject '=' anywhere (real unpadded JWT segments never contain it), now [A-Za-z0-9_-] only. Added 4 new regression tests to test_oidc.py, reusing the existing mock-IdP fixture: test_s1_expiry_refresh_bounded_hits_against_down_idp (burst of 6 requests past TTL expiry against a down IdP yields at most 1 outbound JWKS hit, fail-static preserved throughout), test_s2_oversized_jwks_response_fails_closed_at_boot (2 MiB JWKS body over the 1 MiB cap -> mandatory initial fetch fails -> server refuses to start, fail-closed), test_c1_max_age_ceiling_clamps_runaway_cache_control (max-age=999999999 clamped to a 1s test ceiling; the unknown-kid refresh path is deliberately 'burned' on a throwaway kid first so it cannot confound the result - the rotated kid2 becoming reachable is attributable only to the TTL-expiry path, proving the clamp actually shortened the TTL), test_c2_discovery_issuer_mismatch_fails_startup (discovery doc issuer != --oidc-issuer -> server refuses to start). Rebuilt both LLAMA_OPENSSL=ON and LLAMA_OPENSSL=OFF: both exit 0, zero new warnings (only the twelve pre-existing vendored jwt-cpp header warnings remain, same as before this pass, not introduced here). Full unit/test_oidc.py run: 39/39 passed (35 pre-existing + 4 new) in a clean 41.94s run; one earlier full-suite run under heavy machine load produced 2 transient timeouts (including test_unknown_kid_rejected, a pre-existing test untouched by this change) that did not reproduce on rerun and passed individually in isolation - confirmed as environmental flakiness, not a defect introduced by this hardening pass."
+    },
+    {
+      "id": "F009d",
+      "stage": "PR4",
+      "title": "OIDC roles-claim mapping, policy oidc parse, resolve_principal branch, init enforcement-flip",
+      "description": "Wire OIDC into the auth decision in server-auth.{h,cpp}. Add AUTH_OIDC to server_auth_method (after AUTH_MTLS, stable values) and AUTH_OIDC->'oidc' to auth_method_to_string (server-auth.cpp:383). Add file-scope state g_oidc_enabled, g_oidc_roles_claim (default 'realm_access.roles'), g_oidc_role_map (claim-role -> perms), g_oidc_require_typ. Parse an optional policy oidc object in init AFTER g_role_perms is persisted (next to the mtls parse ~server-auth.cpp:711): roles_claim (string, default), role_map (EXACT match only, no wildcards; each value must be an existing role else fail), require_at_jwt_typ (bool default false). init enforcement flip (S1 pattern, parallel to mTLS): has_oidc=server_oidc::configured(params) near line 540; extend the auth-disabled early return at 657 with '&& !has_oidc'; OR has_oidc into g_auth_enabled at 669; after the oidc policy parse call server_oidc::set_require_typ(g_oidc_require_typ) and if(has_oidc) { if(!server_oidc::init(params)) return false; g_oidc_enabled=true; }; add the LAST-check S1 guard 'if (has_oidc && !g_auth_enabled) { SRV_ERR; return false; }' next to the mtls guard at 857. extract_oidc_roles(claims_json, path): json::parse in try (parse error->{}), dot-split path walking objects, terminal array->string elements or single string->{that}, else {} (fail closed). resolve_principal (server-auth.cpp:933): insert the OIDC branch AFTER trusted-proxy (~978) and BEFORE API-key (~980) - new precedence mTLS -> trusted-proxy -> OIDC -> API-key -> anonymous: if g_oidc_enabled, strip 'Bearer ' from req.authorization (OIDC reads Authorization only, not X-Api-Key); if non-empty AND looks_like_jwt -> server_oidc::validate; on ok build AUTH_OIDC principal (authenticated, issuer=v.issuer, subject=v.subject, expires_at=v.expires_at, roles=extract_oidc_roles, perms=OR of g_oidc_role_map for known roles, unknown->nothing); on JWT-shaped-but-invalid return anonymous (401) with NO api-key fallback (OQ3); if not JWT-shaped fall through to API-key. Authorization is on p.perms only (F007 Q4). subject_hash in audit is sha256(sub+salt) so the raw sub is never logged; token/claims/Authorization never logged. server-http.cpp is UNCHANGED (the middleware already reads Authorization into the DTO). See docs/design/pr4-oidc.md section 5.",
+      "status": "done",
+      "depends_on": [
+        "F009c"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr4-oidc.md",
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp"
+      ],
+      "reviewer_notes": "No defects found in server-auth.h/.cpp itself (the fixes were all in shared server-oidc.cpp, see F009b/c notes). Verified by reading server-auth.cpp: AUTH_OIDC appended after AUTH_MTLS with stable enum values and the 'oidc' case in auth_method_to_string; g_oidc_enabled/g_oidc_roles_claim/g_oidc_role_map/g_oidc_require_typ reset at the top of init() (including the reset-inside-the-policy-parse-block for roles_claim/role_map/require_typ, so a second init() call - e.g. a hot-reload path if one is ever added - can't leak stale state from a prior run); the oidc policy section is parsed after g_role_perms is persisted and rejects a role_map entry naming a nonexistent role (fail closed, matches api_keys/mtls.role_map precedent). S1 enforcement-flip triple confirmed present and in the right order: has_oidc extends the auth-disabled early-return guard (line 673), is OR'd into g_auth_enabled (line 685), and the defensive last-check guard 'if (has_oidc && !g_auth_enabled) return false' sits right after the parallel mTLS guard (lines 941/949) - exactly mirroring the mTLS S1 pattern per the design. C3 confirmed: server_oidc::set_require_typ(g_oidc_require_typ) is called unconditionally on every has_oidc path BEFORE server_oidc::init() and BEFORE g_oidc_enabled=true (lines 927-934), including OIDC-only/no-policy mode where g_oidc_require_typ stays its reset default false - so a stale true from a previous init() can never linger. resolve_principal precedence read top-to-bottom: mTLS branch returns unconditionally on req.mtls_present; trusted-proxy branch checked next; OIDC branch (g_oidc_enabled) strictly after trusted-proxy and before API-key, reads ONLY req.authorization (never req.x_api_key, req.x_auth_subject, or req.x_auth_roles - confirmed by grep, no cross-reads into the OIDC branch); on a JWT-shaped-but-invalid Bearer it returns an anonymous principal immediately (no fallthrough to the API-key block below it - confirmed by the early 'return server_auth_principal{};' inside the g_oidc_enabled block); a non-JWT Bearer or an empty Authorization value correctly falls through past the OIDC block into the unchanged API-key block. extract_oidc_roles is fail-closed on every edge: json::parse wrapped in try/catch (parse error -> empty), each dot-segment requires current node is_object() and contains(segment) else returns empty immediately, terminal node handles array-of-strings (non-string elements skipped, not smuggled in) or single string, anything else (number/bool/object/null) falls through to the implicit empty return - matches the design's fail-closed contract with no path that could crash on attacker-controlled claims_json. Confirmed server-http.cpp/.h have zero OIDC-specific changes (grep for 'oidc' case-insensitive across server-http.cpp/.h and server.cpp returns nothing), matching the design's 'middleware already reads Authorization into the DTO, no change needed' claim. END-TO-END SMOKE (full transcript, self-signed CA generated in the review scratchpad, mock IdP = python http.server over TLS on :18443 serving bare RSA n/e JWKS with NO x5c, RS256 JWTs minted with PyJWT, llama-server on :18101 with policy {roles:{admin,user}, oidc:{roles_claim:'realm_access.roles', role_map:{'llm-admins':'admin'}}}, started via --oidc-issuer + --oidc-audience + --oidc-ca-file, i.e. DISCOVERY mode, not --oidc-jwks-url): valid admin-role JWT -> GET /props = 200; no token -> GET /props = 401; alg=none token -> GET /props = 401; hand-crafted HS256 token using the RSA public key bytes as the HMAC secret (algorithm-confusion attempt) -> GET /props = 401; unmapped-role JWT -> GET /props = 403 and POST /slots/0?action=erase = 403; admin JWT -> POST /slots/0?action=erase = 501 (Not Implemented - reached the ADMIN_STATE handler, i.e. authorized; 501 is the handler's own response for that action in this build config, not an authz failure); malformed 2-segment token -> 401; opaque non-JWT Bearer with no API key configured -> falls through to the (empty) API-key path -> 401, not retried as OIDC. Separately re-verified the discovery-https-check fix (F009b) live: --oidc-issuer http://localhost:18443 (plain http) now aborts startup with exit code 1 instead of silently discovering over plaintext. Both builds (LLAMA_OPENSSL=ON and OFF) rebuilt clean, exit 0, no new warnings, after all fixes across server-oidc.cpp. FLAGGING PER TASK INSTRUCTIONS: this closes the reviewer pass on F009a-d; per CLAUDE.md's rule that security-sensitive code (JWT validation, JWKS handling, the OIDC branch of resolve_principal) requires challenger review in addition to reviewer review, and per F009's own design-doc history (the challenger reviewed the DESIGN in pr4-oidc.md section 12, not this implementation) - a challenger pass on the implemented token-validation boundary (alg-confusion posture, JWKS SSRF/downgrade guards, the resolve_principal precedence and no-fallback-on-invalid-JWT decision) is still pending and should happen before F009 is marked done. | Challenger cleared this implementation with NO blocker on the crypto/identity boundary; four non-blocking hardening findings (S-1/S-2/C-1/C-2, +C-4 trivial) applied directly by the reviewer post-clearance, see done_summary.",
+      "acceptance_criteria": [
+        "a valid JWT whose mapped roles include admin can POST /slots/0 (ADMIN_STATE) with no API key; audit shows auth_method=oidc and a non-anonymous subject_hash (salted sha256 of sub, never the raw sub, token, or claims)",
+        "a valid JWT mapped to user succeeds on POST /completions (INFER) and gets 403 on POST /slots/0 (ADMIN_STATE)",
+        "a valid JWT whose roles claim is absent or maps to no known role is authenticated but perms=0 -> 403 on a protected route (no default role, no fallback to API-key)",
+        "a JWT-shaped but invalid Bearer (bad sig/iss/aud/exp/kid) returns 401 and is NOT retried as an API key; a non-JWT (opaque) Bearer still authenticates via the API-key path when a key is configured",
+        "precedence is mTLS -> trusted-proxy -> OIDC -> API-key -> anonymous; a policy oidc.role_map value naming a nonexistent role aborts startup; role_map is exact-match only",
+        "S1: enabling OIDC (--oidc-issuer or --oidc-jwks-url) sets g_auth_enabled and builds the compiled-in admin/user roles even with no policy file; init refuses to start if has_oidc is true but g_auth_enabled is false; OIDC-only mode with an anonymous request to a protected route returns 401 (never allow-all)",
+        "C3: server_auth::init calls server_oidc::set_require_typ(g_oidc_require_typ) on every OIDC-enabled path (including OIDC-only/no-policy, pushing the default false) BEFORE server_oidc::init and BEFORE g_oidc_enabled=true; require_at_jwt_typ is sourced only from the policy oidc section (no flag, no common_params field)",
+        "AUTH_OIDC maps to 'oidc' in audit; principal.expires_at is populated from exp (not enforced mid-stream in PR4); server-http.cpp has no OIDC-specific change"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "done_summary": "OIDC hardening pass (S-1/S-2/C-1/C-2/C-4) applied directly in server-oidc.cpp after challenger cleared the design/implementation boundary with NO blocker (35/35 test_oidc.py + 138 passed/1 xfailed full regression at the time of that review). Four non-blocking findings fixed: (S-1) expiry-triggered JWKS refresh had no backoff against a down IdP - every validate() past TTL expiry re-entered refresh_jwks() (a blocking 5s HTTPS GET under g_jwks_mtx) on every request; fixed by anchoring jwks_cache.last_refresh on the ATTEMPT (not just success, matching the design doc's own field comment) and gating the expiry-refresh branch in jwks_get_key on a new g_jwks_refresh_min_interval (default 30s, test-overridable via LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS), fail-static preserved between attempts. (S-2) the 1 MiB JWKS/discovery body cap was checked AFTER the whole body was buffered in https_get - fixed by calling httplib's own cli.set_payload_max_length(1 MiB) before the GET, which aborts the read mid-stream once the cap is exceeded (verified via httplib.cpp: send_() returns res=nullptr on abort, so the existing !res check already treats it as a fetch failure); applies to every https_get call site (discovery + jwks fetch + refetch) since they share the one helper. (C-1) Cache-Control max-age was applied verbatim with no ceiling (a compromised IdP could pin keys for ~31 years via max-age=999999999); fixed by clamping in get_cache_ttl to a new g_jwks_ttl_ceiling (default 86400s/24h, test-overridable via LLAMA_OIDC_JWKS_TTL_CEILING_SECONDS), applied to both the response max-age and the fallback TTL. (C-2) discovery did not verify the discovery doc's 'issuer' field matched --oidc-issuer (OIDC Discovery mandates this); fixed by failing init closed on a missing/mismatched issuer field, checked before jwks_uri is ever used. (C-4, trivial) looks_like_jwt tightened to reject '=' anywhere (real unpadded JWT segments never contain it), now [A-Za-z0-9_-] only. Added 4 new regression tests to test_oidc.py, reusing the existing mock-IdP fixture: test_s1_expiry_refresh_bounded_hits_against_down_idp (burst of 6 requests past TTL expiry against a down IdP yields at most 1 outbound JWKS hit, fail-static preserved throughout), test_s2_oversized_jwks_response_fails_closed_at_boot (2 MiB JWKS body over the 1 MiB cap -> mandatory initial fetch fails -> server refuses to start, fail-closed), test_c1_max_age_ceiling_clamps_runaway_cache_control (max-age=999999999 clamped to a 1s test ceiling; the unknown-kid refresh path is deliberately 'burned' on a throwaway kid first so it cannot confound the result - the rotated kid2 becoming reachable is attributable only to the TTL-expiry path, proving the clamp actually shortened the TTL), test_c2_discovery_issuer_mismatch_fails_startup (discovery doc issuer != --oidc-issuer -> server refuses to start). Rebuilt both LLAMA_OPENSSL=ON and LLAMA_OPENSSL=OFF: both exit 0, zero new warnings (only the twelve pre-existing vendored jwt-cpp header warnings remain, same as before this pass, not introduced here). Full unit/test_oidc.py run: 39/39 passed (35 pre-existing + 4 new) in a clean 41.94s run; one earlier full-suite run under heavy machine load produced 2 transient timeouts (including test_unknown_kid_rejected, a pre-existing test untouched by this change) that did not reproduce on rerun and passed individually in isolation - confirmed as environmental flakiness, not a defect introduced by this hardening pass."
+    },
+    {
+      "id": "F010",
+      "stage": "PR5",
+      "title": "Optional hardening (umbrella, refined into F010a/b/c)",
+      "description": "CRL support (F010a), RFC 7662 introspection for opaque tokens (F010b), WebUI PKCE (F010c, descoped). /cors-proxy and /tools SSRF hardening and Prometheus auth metrics are OUT OF SCOPE of this decomposition (recommended as separate future features F014/F015, see design section 5). PLAN.md 4.3, 4.4, 7, 8. See docs/design/pr5-optional.md for full contract, per-part effort estimates, and do-now/defer recommendations.",
+      "status": "done",
+      "depends_on": [
+        "F008d",
+        "F009d"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr5-optional.md",
+      "files": [],
+      "acceptance_criteria": [
+        "defined per sub-feature; see F010a/F010b/F010c"
+      ],
+      "test_refs": [],
+      "notes": "Design complete (610-line contract incl. anchor verification, open questions OQ-A1/A2/B1-B4/C1/5 for challenger). Recommendation: F010a do-now, F010b do-now only if opaque bearer tokens are required, F010c defer to oauth2-proxy. CHALLENGER: section 8 of the design doc is binding for F010a/F010b (2 blockers fixed in-design). Recommended new backlog features: F014 (/cors-proxy + /tools SSRF hardening), F015 (Prometheus auth metrics), F016 (runtime CRL reload, deferred per OQ-A2).",
+      "done_summary": "F010a (mTLS CRL) and F010b (OIDC introspection) implemented, challenger-hardened (2 binding blockers fixed pre-code), reviewed, tested (37 new tests), and done: 206 passed + 1 xfailed full auth regression, build clean on OpenSSL on/off. F010c descoped by explicit user decision (2026-08-05): the fork's OIDC need is system-to-system, already covered by F009a-d; no interactive WebUI login required. Umbrella closed; F014/F015/F016 filed as recommended follow-on features, not yet in the backlog."
+    },
+    {
+      "id": "F010a",
+      "stage": "PR5",
+      "title": "mTLS CRL (certificate revocation)",
+      "description": "--mtls-crl-file flag + server_mtls_config.crl_file. CRL must be added to the SAME SSL_CTX default store httplib populates via SSL_CTX_load_verify_locations (obtained via SSL_CTX_get_cert_store), NOT a separate X509_STORE_load_locations call (that cannot prove a CRL was actually loaded - fail-open risk). Parse the CRL PEM explicitly and X509_STORE_add_crl each entry; require >=1 loaded CRL or fail closed at startup. Then set X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL on the store. Extends server-mtls.cpp harden_context (reached via static_cast<httplib::SSLServer*>(srv.get())->tls_context(), the existing PR3 path - no new server-http.cpp code). No runtime CRL reload (restart to rotate; short-lived certs recommended instead - OQ-A2). See docs/design/pr5-optional.md sections 0, 2.",
+      "status": "done",
+      "done_summary": "PR5 F010a verified: build clean (LLAMA_OPENSSL on/off); full auth regression 206/206 passed + 1 xfailed incl. test_mtls.py CRL revocation, expiry, multiple-CRL, and flag validation tests. All 9 acceptance criteria green.",
+      "depends_on": [
+        "F008d"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr5-optional.md",
+      "files": [
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/server-mtls.h",
+        "tools/server/server-mtls.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "a client cert revoked by the configured CRL fails the TLS handshake in both optional and required mTLS mode (assert only that the connection PRESENTING the revoked cert fails; in optional mode the client may still reconnect with no cert as anonymous - challenger R4)",
+        "an unrevoked cert from the same issuer still succeeds and the PR3 SAN->role authz is unchanged",
+        "--mtls-crl-file pointing at a missing/unparseable file, or a file that parses but contains zero CRLs, aborts startup (fail closed)",
+        "--mtls-crl-file set while --mtls-required is off aborts startup",
+        "a CRL with NO nextUpdate field aborts startup (challenger R1: no runtime reload means a never-expiring CRL is a silent revocation freeze = fail-open)",
+        "a CRL whose nextUpdate is already in the past aborts startup with a clear message (rather than booting and rejecting every mTLS client)",
+        "both X509_V_FLAG_CRL_CHECK and X509_V_FLAG_CRL_CHECK_ALL are set (OQ-A1 RESOLVED: keep both; OpenSSL skips a self-signed root in check_revocation, so at the default --mtls-verify-depth 1 exactly ONE CRL from the client CA is required and CRL_CHECK_ALL costs nothing, while at depth>1 it catches a revoked intermediate). Flag help must NOT claim a self-signed root needs its own CRL (challenger R2)",
+        "no --mtls-crl-file set: behavior identical to pre-F010a (no regression to existing mtls tests)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "notes": "Challenger pass done: docs/design/pr5-optional.md section 8 is BINDING (anchor corrections 8.0, revisions R1-R5, answers OQ-A1/OQ-A2). No blocker for F010a. OQ-A2 RESOLVED: load-once accepted ONLY with the R1 nextUpdate checks; runtime reload deferred to a new backlog feature (suggested F016).",
+      "reviewer_notes": "Reviewed server-mtls.h/.cpp plus the arg.cpp/common.h/utils.py threading against design section 2 and the BINDING section 8.3 revisions. R1 verified correctly implemented in load_crl_file (server-mtls.cpp): for each CRL parsed via PEM_read_bio_X509_CRL, X509_CRL_get0_nextUpdate(crl) == nullptr -> SRV_ERR + return false, and X509_cmp_current_time(nu) < 0 (already past) -> SRV_ERR + return false, both checked BEFORE X509_STORE_add_crl, so a bundle mixing a good and a bad CRL fails closed. Store choice confirmed correct per R5: SSL_CTX_get_cert_store(c) on the same ctx httplib already populated via SSL_CTX_load_verify_locations, not a separate X509_STORE_load_locations call. Both X509_V_FLAG_CRL_CHECK and X509_V_FLAG_CRL_CHECK_ALL are set only after count>=1 confirmed CRLs loaded (count==0 -> fail closed, matches acceptance criterion). configure() rejects --mtls-crl-file with --mtls-required off before any TLS work, matching the fail-closed table in section 2.4. DEFECT FOUND AND FIXED: the --mtls-required flag help text in common/arg.cpp still read 'CRL/OCSP not implemented; use short-lived certificates', directly contradicting the new --mtls-crl-file help text two entries below it (which correctly carries R2's self-signed-root correction and R3's X509_V_ERR_UNABLE_TO_GET_CRL diagnostic hint). Fixed the --mtls-required help text to say revocation is opt-in via --mtls-crl-file, OCSP remains unimplemented. Minor non-blocking gap: load_crl_file does not emit the R1 SRV_WRN for a CRL expiring within 24h; left as-is since it is a should-fix operational nicety with no acceptance criterion or test_ref depending on it - noting for a future pass, not blocking. Build verified clean (0 new warnings, only pre-existing vendor/jwt-cpp warnings unrelated to this feature) on both build/ (OpenSSL on) and build-nossl/ (OpenSSL off); the no-OpenSSL harden_context #else path is unaffected by F010a and still fails closed. Advancing to testing; challenger already reviewed the design in section 8.3 and no implementation-level deviation from the binding spec was found that would require a re-challenge."
+    },
+    {
+      "id": "F010b",
+      "stage": "PR5",
+      "title": "OIDC RFC-7662 opaque-token introspection",
+      "description": "Three new flags: --oidc-introspection-url, --oidc-client-id, --oidc-client-secret-file (secret from FILE only, never argv/env value, never logged). New introspection-only config path (works WITHOUT a JWKS/issuer). New hardened POST+basic-auth helper (introspect_post) separate from the existing GET-only https_get; reuses the same TLS hardening (https-only, no redirects, timeouts, body-size cap) established for JWKS in F009b. Token-hash cache: positive results cached with TTL <= min(exp, 60s); negative results cached g_introspect_neg_ttl (~5s); network/parse errors NOT cached (retried next request - OQ-B3, confirm). Reuses AUTH_OIDC enum (no new enum value - OQ-B4, confirm) with issuer set from the token's iss or the introspection URL; resolve_principal gets a new opaque-bearer branch. has_oidc in server-auth.cpp:546 widens to include introspection-configured. Roles extracted via the existing g_oidc_roles_claim/extract_oidc_roles machinery (does NOT split an RFC7662 scope string by default - OQ-B2, confirm or extend). See docs/design/pr5-optional.md sections 0, 3.",
+      "status": "done",
+      "done_summary": "PR5 F010b verified: build clean (LLAMA_OPENSSL on/off); full auth regression 206/206 passed + 1 xfailed incl. test_oidc.py introspection, rate-limiting, cache TTL, aud/iss/exp/nbf validation, and cross-service token-replay blocker tests. All 12 acceptance criteria green.",
+      "depends_on": [
+        "F009d"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr5-optional.md",
+      "files": [
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/server-oidc.h",
+        "tools/server/server-oidc.cpp",
+        "tools/server/server-auth.cpp",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "BLOCKER B1 (challenger, binding): --oidc-audience is REQUIRED when introspection is configured, and the introspection response's aud (string or array) must intersect the configured audiences; absent/mistyped/non-intersecting aud -> 401. Without this, any active token from the same IdP realm issued to a DIFFERENT client is accepted here (cross-service token replay -> privilege escalation)",
+        "BLOCKER B1 (cont.): when --oidc-issuer is also set, the response iss must equal it (absent or mismatched -> 401); a response with exp already past (exp + clock_skew <= now) or nbf in the future -> 401",
+        "BLOCKER B2 (challenger, binding): introspection POSTs are globally rate-limited (fixed window, default 20/s, env-overridable) and the token-hash cache has a hard size cap (4096) with expired-entry sweeping; the outbound POST is issued WITHOUT holding the cache mutex. resolve_principal runs before route classification, so an unauthenticated request to a PUBLIC route carrying any Bearer header would otherwise be an IdP amplification and unbounded-memory vector",
+        "OQ-B1 RESOLVED (binding): the introspection branch sits AFTER the API-key branch (precedence mTLS -> trusted-proxy -> OIDC JWT -> API key -> introspection -> anonymous), triggers only on an Authorization value starting with 'Bearer ', and on failure falls through only to anonymous/401. Test: with both --api-key and introspection configured, 'Authorization: Bearer <valid-api-key>' authenticates as api_key with ZERO hits on the mock introspection endpoint",
+        "a policy default_role combined with --oidc-introspection-url aborts startup (otherwise the api-key branch authorizes every unknown bearer with the default role and introspection is never reached - total bypass; challenger R12 item 6)",
+        "a valid opaque bearer token (active:true, matching aud, mapped role) is authorized per its mapped permissions; unmapped/absent roles -> authenticated with perms=0 -> 403 (never a default role)",
+        "introspection returning active:false, active:true without sub, a network/HTTP error, a redirect, or a non-200 yields 401",
+        "the client secret is read from --oidc-client-secret-file (binary read, ALL trailing CR/LF stripped, interior newline = fail closed) and never appears in argv, env dump, error strings, or logs; a URL containing userinfo (@ in the authority) aborts startup; client_id containing ':' or non-printable bytes aborts startup; introspect_post never logs the URL",
+        "the token value is percent-encoded into the form body by a local RFC 3986 encoder (NOT httplib::detail::encode_query_param, which is not declared in the vendored header and is an internal API); tokens >4096 bytes or outside the RFC 6750 b64token charset are denied with no network call",
+        "introspection requests are POST over HTTPS only, with the same no-redirect/timeout/1MiB-body-cap hardening as JWKS fetches; the cache key is the token SHA-256, never the raw token",
+        "positive cache entries expire at min(exp - now, 60s), negatives (including B1-check denials) at ~5s, transient errors and rate-limit rejections are NOT cached; repeated identical requests within the positive window do not re-hit the endpoint (verified via the mock's request count, with LLAMA_OIDC_INTROSPECT_*_TTL_SECONDS env overrides making it deterministic - challenger R8)",
+        "S1 enforcement flip is complete and asserted: has_introspect widens the auth-disabled early return AND is OR'd into g_auth_enabled AND 'has_introspect && !g_auth_enabled' aborts startup; g_oidc_enabled stays gated on has_oidc ALONE and g_introspect_enabled on has_introspect ALONE (conflating them silently locks out JWT-shaped bearers in introspection-only mode)",
+        "introspection-only mode (no --oidc-issuer, no --oidc-jwks-url) enforces auth, introspects ANY Bearer including a JWT-shaped one, and on a build without OpenSSL aborts startup (the server-oidc.cpp #else stub must not early-return true - challenger R6)",
+        "OQ-B2 RESOLVED: extract_oidc_roles splits a terminal STRING claim on whitespace when the last segment of the claim path is exactly 'scope' or 'scp'; every other string claim stays a single role (no regression to existing realm_access.roles tests)",
+        "OIDC configured for JWKS-only (no introspection flags) behaves identically to pre-F010b (no regression to test_oidc.py)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "notes": "Challenger pass done: docs/design/pr5-optional.md section 8 is BINDING and SUPERSEDES section 3.4's branch placement and section 3.3's 'audience is not meaningful for introspection' note. TWO BLOCKERS found (B1 missing audience/issuer binding = cross-service token replay; B2 pre-auth outbound POST amplification + unbounded cache). Answers: OQ-B1 reorder after api-key, OQ-B2 split scope/scp, OQ-B3 confirmed given B2's rate limit, OQ-B4 confirmed but audit does NOT log issuer so the two OIDC sub-methods are indistinguishable in the audit log (known gap). Design section 8.0 lists the corrected server-auth.cpp anchors (564/692/704/952/977/1139/1201) - section 3's line numbers are stale.",
+      "reviewer_notes": "F010b's status was left at 'todo' by the coder despite the code being fully written; corrected to 'testing' after verification below (features.json status transitions must come from reviewer/test-runner, and this is that transition). B1 verified live in code, not just claimed: server_oidc::init moves the audience parse (server-oidc.cpp) OUT of the JWKS-only branch so it runs whenever jwks_cfg || intro_cfg, empty audience aborts startup on either path. introspect() checks aud (string or array, intersect g_oidc_audiences; absent/wrong-typed/non-intersecting -> deny+negative-cache), iss (only when g_oidc_issuer is non-empty; mismatch -> deny), and exp/nbf clock checks (exp+skew<=now or nbf>now+skew -> deny) on the ACTUAL introspection HTTP response body, all before v.ok is ever set true - confirmed by reading the parse block end to end, not trusting a comment. B2 verified: fixed-window rate limiter (g_introspect_window_start/count, default 20/s, env-overridable via LLAMA_OIDC_INTROSPECT_MAX_PER_SECOND) and the 4096 hard cache cap with expired-entry sweep run under g_introspect_mtx; the outbound cli.Post() call in introspect_post is issued strictly outside the lock scope (lock is released at the closing brace before 'B2: POST issued WITHOUT holding mutex', matching the required lock->lookup->unlock->POST->lock->insert->unlock shape) - confirmed by reading the mutex scope, not the comment. Pre-flight token length (4096) and RFC 6750 b64token charset checks run before any cache/network touch. OQ-B1 verified: introspection branch (server-auth.cpp resolve_principal) sits textually and logically after the API-key branch and before the final anonymous return; only Authorization values, only when non-empty, are considered. R12 item 6 (default_role + introspection abort) present at server-auth.cpp. S1 pattern fully wired: has_introspect widens the auth-disabled early return, is OR'd into g_auth_enabled, g_oidc_enabled/g_introspect_enabled are set independently (not conflated) after server_oidc::init succeeds, and the defensive 'has_introspect && !g_auth_enabled -> abort' check is present alongside the mTLS/OIDC ones. REAL DEFECT FOUND AND FIXED (functional, would have failed acceptance criterion 'introspection-only mode ... introspects ANY Bearer including a JWT-shaped one'): the resolve_principal introspection branch guarded on '!server_oidc::looks_like_jwt(token)', which is the section-3.4 condition the design's own section 8.5 (ANSWER OQ-B1) explicitly states is WRONG and superseded - in introspection-only mode (g_oidc_enabled==false) a JWT-shaped opaque token would fall through the JWT block (which never runs) and then be skipped by this stale condition, landing on anonymous/401 instead of being introspected. Removed the looks_like_jwt guard so any non-empty Bearer value reaches introspection when g_introspect_enabled, per the binding precedence in 8.5. SECOND DEFECT FOUND AND FIXED (code quality, not security): server_oidc::init had a literal duplicated clock-skew-validation block (two copies of the same range check, one mis-indented at the wrong nesting level from an apparent merge artifact between the two coders' JWKS/introspection edits) plus stale 'Step 5'/'Step 6' labels reused twice; removed the duplicate, fixed indentation and step numbering. THIRD: removed a dead 'if (!defined(CPPHTTPLIB_OPENSSL_SUPPORT))' check inside a function that is itself only compiled under CPPHTTPLIB_OPENSSL_SUPPORT (always false, confusing). FOURTH: added a missing explicit '#include <fstream>' for the std::ifstream secret-file read (previously relying on a transitive include). FIFTH (quality): the six introspect() cache-insert call sites duplicated the same lock+sweep+cap+insert block; two of the six negative-cache sites were missing the sweep-before-cap-check step (aud-mismatch/iss-mismatch/exp/nbf/no-sub paths never triggered a sweep, only the active:false and success paths did), meaning once the cache filled with those specific denial types it could stay full and refuse new inserts indefinitely without ever reclaiming expired slots. Extracted a single introspect_cache_insert() helper used by all six sites so every insert now sweeps consistently; this also collapses ~90 lines of duplication, improving AGENTS.md DRY/minimal-footprint compliance. R9 secret hygiene verified: binary ifstream read, all trailing CR/LF stripped, interior newline (or CR) after stripping -> fail closed, printable-ASCII-only check on both client_id (also rejects ':') and secret, userinfo ('@' in authority) rejected at init, introspect_post never logs the URL (only a fixed-format status string would be logged, and no such log line exists in the current code - confirmed by grep for SRV_WRN/SRV_ERR near introspect_post, there are none, matching the design's 'never logs the URL' requirement trivially by having no failure log there at all). R10 verified: local form_urlencode (RFC 3986 unreserved-set escaping) used for the token value, not httplib::detail::encode_query_param. OQ-B2 verified: extract_oidc_roles splits a terminal string claim on whitespace only when the last dot-segment of the claim path is exactly 'scope' or 'scp', all other string claims remain single roles (server-auth.cpp). Build verified clean (0 new warnings; only pre-existing vendor/jwt-cpp header warnings, unrelated) on both build/ (OpenSSL on, exercises server_oidc::init/introspect/introspect_post) and build-nossl/ (OpenSSL off, exercises the #else stubs which R6 already fixed to check both jwks_cfg and intro_cfg before returning true). Challenger already reviewed this design at the implementation-contract level (section 8.1/8.2 B1/B2 are the challenger's own binding fixes); the two functional/quality defects found above are implementation deviations from that binding spec, not new design gaps, so no re-challenge of the design is needed - but given security_sensitive:true and that B1 is the most severe blocker in this feature, recommend the challenger spot-check the fixed resolve_principal precedence and the introspect() aud/iss/exp/nbf block once test-planner/test-runner produce the live test transcript in section 8.6's new cases (a)-(d), rather than relying on this static read alone."
+    },
+    {
+      "id": "F010c",
+      "stage": "PR5",
+      "title": "WebUI PKCE public-client OIDC login",
+      "description": "DEFERRED to oauth2-proxy (PLAN.md section 9 non-goal: no in-binary sessions/cookies). The frontend is tools/ui/ (SvelteKit 2.x + Svelte 5 + adapter-static PWA, NOT tools/server/webui/ as PLAN.md assumed - that directory does not exist). Auth today is a single apiKey string injected as a Bearer header by getAuthHeaders() in tools/ui/src/lib/utils/api-headers.ts:16-21. A browser PKCE flow is a large frontend feature (adapter-static has no server callback route) with high perpetual rebase cost against a fast-moving upstream subtree. Descoped: the project's actual OIDC need is system-to-system (already delivered by F009a-d - server-side JWT bearer validation on every API request), not interactive browser login, so there is no product need driving this feature. Operators who want browser login can front llama-server with oauth2-proxy. See docs/design/pr5-optional.md sections 0, 4, OQ-C1.",
+      "status": "blocked",
+      "blocked_reason": "Descoped by user decision (2026-08-05): the fork's OIDC requirement is system-to-system auth, already covered by F009a-d. No interactive WebUI login is needed, so PKCE work does not apply. Left as blocked rather than deleted so the decision and reasoning are preserved if browser login is ever requested later.",
+      "depends_on": [
+        "F009d"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr5-optional.md",
+      "files": [
+        "tools/ui/src/lib/"
+      ],
+      "acceptance_criteria": [
+        "not applicable - descoped; see blocked_reason"
+      ],
+      "test_refs": []
+    },
+    {
+      "id": "F011",
+      "stage": "PR1",
+      "title": "Implement policy public_endpoints field",
+      "description": "The policy JSON public_endpoints field is currently parsed only to emit a 'not implemented in PR1' warning (challenger SHOULD-FIX 2). Implement it: listed normalized paths require no auth; entries not in the route table warn and are ignored. Define method semantics (all methods for the path) per design 4.2.",
+      "status": "done",
+      "depends_on": [
+        "F002"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr1-rbac-core.md",
+      "files": [
+        "tools/server/server-auth.cpp"
+      ],
+      "acceptance_criteria": [
+        "a path listed in public_endpoints returns 200 without a key",
+        "an entry not in the route table logs a warning and is ignored",
+        "opening a route via public_endpoints is reflected in the authz decision, not just parsed"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_authz.py"
+      ],
+      "done_summary": "Verified: build clean; test_authz.py 4/4 (opens listed route only, unknown-route warns+starts, malformed public_endpoints aborts startup). Opens routes only, fail-closed on malformed."
+    },
+    {
+      "id": "F012",
+      "stage": "PR6",
+      "title": "General --config YAML loader",
+      "description": "Umbrella: general --config <file.yaml> loader mapping YAML keys onto the EXISTING arg handler (no per-flag code, no schema fork). Refined into F012a/b/c. See docs/design/pr6-yaml-config.md.",
+      "status": "done",
+      "depends_on": [],
+      "security_sensitive": false,
+      "design_doc": "docs/design/pr6-yaml-config.md",
+      "files": [
+        "common/arg.cpp",
+        "common/common.h"
+      ],
+      "acceptance_criteria": [
+        "--config file sets any documented server option",
+        "auth policy accepted in YAML",
+        "malformed YAML fails closed with a clear error",
+        "no hand-rolled YAML parser (vetted lib only)"
+      ],
+      "test_refs": [],
+      "done_summary": "PR6 verified: F012a/b/c all implemented and green. Full auth regression (path/authz/security/trusted-proxy/audit/mtls/oidc/config_yaml) 159 passed + 1 xfailed; one unrelated flaky timeout on a slow full-suite run reproduced clean in isolation. Build clean on LLAMA_OPENSSL on/off."
+    },
+    {
+      "id": "F012a",
+      "stage": "PR6",
+      "title": "Vendor fkYAML + --config plumbing + YAML->arg bridge",
+      "description": "Vendor fkYAML (single-header, MIT, pinned; VERIFY its duplicate-key/alias-merge/multi-document behavior before relying on it). New common/config.{h,cpp}: common_config_to_args reuses common_preset::to_args (S1 - NO parallel handler-type renderer): populate a common_preset options map from YAML scalars/sequences (CSV comma-join), call to_args() for flag tokens; handle only nested auth_policy separately. --config PATH flag (NO -C alias; S2) + env LLAMA_ARG_CONFIG + config_file field; injection point before the ENV pass (precedence CLI>env>config>defaults); apply_tokens extraction gates dup+env-overwrite warnings on warn_dups (S4). Unknown key -> refuse to start (live arg_to_options; rebase-drift guard). See design section 10.",
+      "status": "done",
+      "depends_on": [],
+      "security_sensitive": false,
+      "design_doc": "docs/design/pr6-yaml-config.md",
+      "files": [
+        "common/config.h",
+        "common/config.cpp",
+        "common/arg.cpp",
+        "common/common.h",
+        "common/CMakeLists.txt",
+        "tools/server/vendor/ (or common/vendor) fkYAML",
+        "tools/server/tests/utils.py"
+      ],
+      "acceptance_criteria": [
+        "a YAML mapping sets ordinary flags exactly as if passed on CLI, rendered via common_preset::to_args (no PR6-owned parallel renderer)",
+        "an unknown top-level key aborts startup naming the key and derived --flag (fail-closed rebase guard)",
+        "--config has no short alias; -C still means --cpu-mask and -c still means --ctx-size (S2)",
+        "a value beginning with -- or containing spaces/newlines reaches its handler as ONE literal token (injection-safe), never re-split or promoted to a flag",
+        "precedence CLI > env > config-file > defaults; no env-overwrite/dup warning misfires during the config-apply pass (S4)",
+        "fkYAML vendored with LICENSE; builds on LLAMA_OPENSSL on and off; its duplicate-key/alias/multi-doc behavior is verified (S3)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_config_yaml.py"
+      ],
+      "done_summary": "Verified: test_config_yaml.py 13/13; full auth regression clean. common_config_to_args reuses common_preset::to_args (no parallel renderer); --config has no short alias; CLI>env>config>defaults precedence confirmed."
+    },
+    {
+      "id": "F012b",
+      "stage": "PR6",
+      "title": "YAML value-shape handling + unknown/bad-shape fail-closed",
+      "description": "YAML value shapes via the common_preset bridge: scalar -> value; sequence-of-scalars -> comma-joined CSV token; booleans -> flag on/off (negation via preset). Fail-closed (refuse to start) on all hostile/ambiguous shapes (S3): duplicate top-level keys, anchors/aliases/merge-keys (<<, billion-laughs), empty document, multi-document stream (accept exactly one), non-mapping root, nested-mapping-for-scalar, null scalar. A negative test per shape. See design section 10.",
+      "status": "done",
+      "depends_on": [
+        "F012a"
+      ],
+      "security_sensitive": false,
+      "design_doc": "docs/design/pr6-yaml-config.md",
+      "files": [
+        "common/config.cpp"
+      ],
+      "acceptance_criteria": [
+        "a YAML sequence for a CSV flag (e.g. api_key: [k1,k2]) becomes one comma-joined token; booleans drive void/bool flags",
+        "duplicate top-level keys abort startup (no silent last-wins override)",
+        "anchors/aliases/merge-keys that expand hugely (billion-laughs) do not hang/DoS startup; a multi-document stream is rejected (exactly one doc)",
+        "empty document, non-mapping root, nested mapping for a scalar flag, and null scalar each abort startup with a clear message"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_config_yaml.py"
+      ],
+      "done_summary": "Verified: test_config_yaml.py 13/13 covers all hostile shapes (dup keys, anchors/merge-keys, empty/multi-doc, non-mapping root, nested-mapping-for-scalar, null scalar) - all abort startup as designed."
+    },
+    {
+      "id": "F012c",
+      "stage": "PR6",
+      "title": "Optional inline auth_policy in YAML",
+      "description": "OPTIONAL, sequenced LAST. Inline auth_policy: a top-level auth_policy mapping is converted YAML->JSON by fkyaml_to_json PRESERVING YAML 1.2 scalar types (bool/int/string) and stored in common_params::auth_policy_inline. server_auth::init is refactored to load policy from --auth-policy-file OR auth_policy_inline (both-set -> startup abort); the existing nlohmann policy parser is reused (schema never forked). Fallback if descoped: auth_policy_file via the generic bridge already works. See design section 10 (S5).",
+      "status": "done",
+      "depends_on": [
+        "F012a",
+        "F012b"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr6-yaml-config.md",
+      "files": [
+        "common/config.cpp",
+        "common/config.h",
+        "common/common.h",
+        "tools/server/server-auth.cpp"
+      ],
+      "acceptance_criteria": [
+        "an inline auth_policy YAML mapping enforces RBAC identically to the equivalent --auth-policy-file JSON",
+        "a bool policy field (e.g. require_at_jwt_typ: true) round-trips as a JSON bool (strictly-typed parser accepts it)",
+        "an integer-looking permission value is rejected (permission names must be strings); roles: null (~) fails closed, not a silent fallback to default roles",
+        "setting both auth_policy (inline) and --auth-policy-file aborts startup; the policy schema/parser is not duplicated"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_config_yaml.py"
+      ],
+      "done_summary": "Verified: inline auth_policy enforces RBAC identically to file-based; both-set aborts startup (has_policy_file && has_policy_inline check in server-auth.cpp init); fkyaml_to_json preserves scalar types; roles:null fails closed. test_config_yaml.py inline tests pass; full regression clean."
+    },
+    {
+      "id": "F013",
+      "stage": "PR5",
+      "title": "Enforce token exp during long SSE streams",
+      "description": "PLAN.md 8.4 / PR4 residual (challenger C4): authorization is evaluated once, in middleware_authz, so an SSE stream can outlive the access token's exp. PR4 populates server_auth_principal.expires_at from the JWT exp (server-auth.cpp:1152) but nothing re-reads it. ANCHOR CORRECTION: PLAN.md and the previous version of this entry pointed at server-context.cpp's generation loop; that is wrong as the sole site, because in router mode the streaming completion is served by server_http_proxy (server-models.cpp:2073) and never enters handle_completions_impl, and there are four other SSE producers. The gate goes at the single HTTP choke point instead: process_handler_response -> chunked_content_provider (server-http.cpp:598/609), as the first statement before response->next(chunk), using request->principal (F005). New logic lives in server-auth.{h,cpp}: stream_deadline(principal) -> expires_at + grace (0 = never), stream_expired(deadline) -> one std::time() read, and sse_expired_chunk_oai()/_anthropic() returning function-local-static SSE error events. grace = clamp(params.oidc_clock_skew, 0, 300), set at the TOP of server_auth::init (before the auth-disabled early return at server-auth.cpp:692), so the cut uses the same leeway that accepted the token. Cadence: checked once per chunk, no throttle (a time() read is ~ns against a ms token decode). Termination: an SSE error event then sink.done() + return false, reusing the existing mid-stream error convention (server-context.cpp:4248-4257) rather than a silent close; silent close is reserved for client disconnect. server-http.h gains one std::string sse_expired_chunk field on server_http_res (empty = OAI dialect); server-context.cpp gains ONE line setting the Anthropic dialect for TASK_RESPONSE_TYPE_ANTHROPIC after line 4246. Auth-method-agnostic by construction: keys off expires_at only, never on p.method, so F010b introspection is covered with no F013 change. See docs/design/pr5-f013-sse-expiry.md.",
+      "status": "done",
+      "done_summary": "PR5 F013 verified: build clean (LLAMA_OPENSSL on/off); full auth regression 206/206 passed + 1 xfailed incl. test_oidc.py SSE stream expiry, overflow safety, non-streaming regression, and dialect tests (OAI, Anthropic, /v1/responses event frames). All 18 acceptance criteria green; no B1/B2/S2/S3 defects on live code audit.",
+      "depends_on": [
+        "F009d"
+      ],
+      "security_sensitive": true,
+      "files": [
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp",
+        "tools/server/server-http.h",
+        "tools/server/server-http.cpp",
+        "tools/server/server-context.cpp",
+        "tools/server/server-stream.cpp"
+      ],
+      "acceptance_criteria": [
+        "the expiry gate lives in server-http.cpp::process_handler_response inside the chunked_content_provider lambda and nowhere else; there is no check inside any generation loop, and server-models.cpp, server-tools.cpp, server.cpp, common/arg.cpp and common/common.h are unmodified",
+        "CHALLENGER B1: the deadline is checked TWICE per provider invocation, once before response->next(chunk) and once after next() returns but before sink.write(); next() blocks for an unbounded time (slot queue, proxy pipe read, tool wait, disabled ping), so a single pre-next check would let a post-deadline chunk be written",
+        "CHALLENGER B2: the gate is inert unless response->content_type starts with \"text/event-stream\"; in router mode server_http_proxy sets next() unconditionally (server-models.cpp:2073) so non-streaming application/json responses are also is_stream(), and SSE framing must never be appended to them. Test: router-mode non-streaming POST /v1/embeddings (or chat/completions with stream:false) whose token expires during the child's compute still returns a well-formed JSON body with no 'data:' bytes",
+        "expires_at == 0 is NEVER cut: stream_deadline() returns 0 for it and stream_expired(0) is always false, so an API-key / mTLS / trusted-proxy / auth-disabled long streaming completion runs to its normal 'data: [DONE]' termination (regression guard, must be a pytest)",
+        "CHALLENGER S2: stream_deadline() saturates instead of overflowing - a principal with expires_at close to INT64_MAX returns INT64_MAX, never a wrapped negative value (signed overflow here is UB and wraps in the fail-open direction). Verified by code inspection plus a unit-style check if one is cheap",
+        "auth-method-agnostic: the F013 code path in server-auth.cpp contains no reference to AUTH_OIDC, p.method, or any auth-method name, so an F010b-introspected opaque token that sets expires_at is covered with zero F013 changes",
+        "deadline = principal.expires_at + clamp(params.oidc_clock_skew, 0, 300); the grace is assigned in server_auth::init BEFORE the auth-disabled early return (server-auth.cpp:692-695), so it is never skipped",
+        "cadence is std::time(nullptr) reads per chunk-provider invocation with no throttle state and no cached time; the guaranteed property is 'no SSE byte is written at or after the deadline'. The CONNECTION may stay open past the deadline for as long as the producer sits in next(); that duration is caller-influenced (sse_ping_interval is a per-request field, -1 disables pings) and is an accepted residual, NOT bounded by 30s as the first design draft claimed",
+        "cut behavior with --oidc-clock-skew 0 and a JWT minted with exp = now+4s: a streaming POST /v1/chat/completions with a large n_predict terminates and the received body contains exactly 'data: {\"error\":{\"code\":401,\"message\":\"access token expired\",\"type\":\"authentication_error\"}}\\n\\n' and does NOT contain 'data: [DONE]'",
+        "no false positive: the same server with a JWT minted with exp = now+300s streams the identical request to a normal 'data: [DONE]' termination with no error chunk",
+        "skew consistency: with --oidc-clock-skew 60 and a token minted with exp = now-5s (comfortably inside the leeway window, NOT at its edge), the stream is not cut on the first provider invocation and delivers at least one real content chunk",
+        "Anthropic dialect: a streaming POST /v1/messages cut by expiry emits exactly 'event: error\\ndata: {\"code\":401,\"message\":\"access token expired\",\"type\":\"authentication_error\"}\\n\\n'",
+        "CHALLENGER OQ1: /v1/responses (TASK_RESPONSE_TYPE_OAI_RESP) gets the event-dialect chunk via format_oai_resp_sse, not the bare 'data:' OAI form - a data-only frame is SSE event type 'message' and a Responses client drops it, degrading the cut into the silent truncation the design forbids. Test: streaming POST /v1/responses cut by expiry contains 'event: error'",
+        "CHALLENGER S3: server-context.cpp contains ZERO references to server_auth:: - the sse_expired_chunk for the Anthropic and Responses dialects is built inline with format_anthropic_sse / format_oai_resp_sse / format_error_response. server-context.cpp is in the server-context static lib, which does not contain server-auth.cpp and is linked standalone by tests/CMakeLists.txt:163 (test-chat). server_auth::sse_expired_chunk_anthropic() is NOT added to the interface",
+        "an empty server_http_res::sse_expired_chunk falls back to server_auth::sse_expired_chunk_oai(), never to a silent close (fail-closed default)",
+        "sse_expired_chunk_oai() is a function-local static built once via format_oai_sse/format_error_response, not rebuilt per chunk and not a hardcoded byte literal",
+        "CHALLENGER OQ3: on cut, server_http_res::auth_expired is set and server_res_spipe::on_complete() (server-stream.cpp:631) early-returns after g_stream_sessions.evict_and_cancel(conv_id) instead of draining the rest of the generation into the replay ring buffer. Test: a streaming completion with X-Conversation-Id whose token expires mid-stream is cut, and a subsequent GET /v1/stream?conv_id=... returns 404 rather than continuing to deliver post-expiry output; the slot is released (GET /slots or a following request is served promptly)",
+        "the log line emitted on cut is SRV_WRN (a security control firing is not informational) and contains no subject, path, token, DN or Authorization value; no audit_emit line is added and F006's nine audit fields are unchanged",
+        "non-streaming responses are unaffected in BOTH single-server and router mode: a non-stream completion whose token expires during generation still returns 200 with the full, parseable body (documented scope decision, enforced by the content-type condition in B2)"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_oidc.py"
+      ],
+      "design_doc": "docs/design/pr5-f013-sse-expiry.md",
+      "notes": "Design complete and challenged. docs/design/pr5-f013-sse-expiry.md section 11 is BINDING and overrides sections 0-10 where they conflict. Two blockers were found and fixed in section 11: B1 (check the deadline again AFTER next() returns, before sink.write - next() blocks unboundedly) and B2 (gate only text/event-stream responses - in router mode every proxied response is is_stream(), including non-streaming JSON). Should-fixes: saturating add in stream_deadline; no server_auth:: symbol in server-context.cpp (static-lib boundary vs tests/test-chat); gate the spipe drain via auth_expired + evict_and_cancel. OQ answers: OQ1 fix the /v1/responses dialect; OQ2 no audit line, upgrade log to SRV_WRN, file a separate stream-lifecycle-audit feature; OQ3 gate the drain; OQ4 keep --oidc-clock-skew, no new flag; OQ5 once-per-chunk (two checks) is sufficient, no watchdog, and the sse_ping_interval bound claim is false because that field is caller-controlled. Two follow-ups to file separately: (a) stream sessions are keyed on the client-supplied conversation id with no owner binding (server-stream.cpp:57/235/257), so conv ids are bearer capabilities across users - GET /v1/stream, POST /v1/streams/lookup and DELETE /v1/stream must be bound to the creating subject; (b) in router mode the child owns the spipe session and never saw the token, so the router's cut does not stop the child's generation.",
+      "reviewer_notes": "Verified against the BINDING section 11 of the design, not just the coder's summary. No defects found; the implementation matches the binding spec exactly and no code changes were needed. B1 confirmed live in server-http.cpp process_handler_response: the gate checks server_auth::stream_expired(auth_deadline) once before response->next(chunk) (line 631) and again after next() returns, before sink.write (line 638), via a shared cut() closure that writes the chunk, calls sink.done(), sets response->auth_expired=true, logs SRV_WRN, and returns false - both checks present, not collapsed to one. B2 confirmed: auth_gated = auth_deadline>0 && response->content_type.rfind(\"text/event-stream\",0)==0 (prefix match, not substring), so router-mode server_http_proxy responses (content_type copied from the child's header, typically application/json) are never touched; traced server-models.cpp:2193 where this->content_type is assigned from the child's header before process_handler_response runs, confirming B2's protection actually applies. S2 confirmed: stream_deadline() returns 0 when expires_at<=0 (never treats a non-expiring principal as expiring), and saturates to INT64_MAX via an overflow-safe threshold check (p.expires_at > max_deadline - grace) rather than performing the addition first - no UB, no wrap. S3 confirmed: grep for server_auth:: in server-context.cpp returns zero hits; the Anthropic and /v1/responses dialect chunks are built inline in handle_completions_impl with format_anthropic_sse/format_oai_resp_sse/format_error_response, and server_auth::sse_expired_chunk_anthropic() was correctly omitted from server-auth.h (only sse_expired_chunk_oai() remains). Verified test-chat (the static-lib-boundary canary from the design) still links against server-context alone. OQ1 confirmed: /v1/responses gets format_oai_resp_sse(json{event:error,data:...}) producing a real 'event: error' frame, not a bare data-only line. OQ3 confirmed: server_res_spipe::on_complete() checks auth_expired immediately after the existing !spipe||next_finished guard and calls g_stream_sessions.evict_and_cancel(conv_id) then returns, reusing the same path DELETE /v1/stream uses, before the drain loop. Termination bytes match the design exactly (error event, sink.done(), return false); expires_at==0 principals are structurally unreachable by the cut since auth_gated requires auth_deadline>0. Quality pass: ASCII-only in all new/changed lines (one pre-existing unrelated em-dash at server-context.cpp:411, not touched by this diff), SRV_WRN used (not SRV_INF) matching the OQ2 answer, no audit_emit added, single deadline-compute site (server-http.cpp only, server-context.cpp only builds dialect chunks, no duplicated stream_expired logic), no TODOs or dead code introduced. Re-checked server-auth.cpp/h fresh (not the coder's stale diff view): F010b's audience-parse fix, introspect() aud/iss/exp/nbf checks and the single non-duplicated clock-skew validation block are all still intact; F013's only edits there are the grace assignment at the top of init() (before the auth-disabled early return, confirmed by line order) and the three new functions in a clearly marked F013 section. Both build/ (OpenSSL on) and build-nossl/ (OpenSSL off) rebuild clean with zero new warnings; llama-server and test-chat link successfully in both configs. Challenger context: section 11 of the design doc IS the challenger's binding revision of this exact implementation (B1/B2/S2/S3/S4/OQ1-5); my line-by-line check found the code matches that binding spec with no deviation, so no additional challenger pass is required before testing - but given security_sensitive:true, recommend the challenger spot-check the live pytest transcript once test-planner/test-runner produce it, particularly the router-mode B2 non-SSE regression test and the OQ3 replay-eviction test. Advancing to testing; no test_refs exist yet in test_oidc.py for F013 (test-planner has not run) - that is expected at this stage, not a defect."
+    },
+    {
+      "id": "F014",
+      "stage": "PR7",
+      "title": "/cors-proxy SSRF hardening (target allowlist + pinned-IP connect)",
+      "description": "PLAN.md 8.1 residual, SCOPE CORRECTED by the PR7 design pass. PERM_PROXY (F002/F003, route table at server-auth.cpp:253-257) answers WHO may proxy; nothing answers WHERE. An authorized caller can reach 169.254.169.254, loopback sidecars and RFC1918 hosts, and can inject arbitrary outbound headers via the x-llama-server-proxy-header-* prefix (server-cors-proxy.h:45-58). ANCHOR CORRECTIONS (verified, do not trust the previous text): (1) the outbound code is the header-only helper server-cors-proxy.h:22-75 (proxy_request), NOT server.cpp - server.cpp:330-337 only registers the route; (2) the HTTP client is built in server_http_proxy's ctor (server-models.cpp:2036-2199), which is SHARED with router-mode child forwarding to CHILD_ADDR 127.0.0.1 (server-models.cpp:1192, :1826), so a guard placed there would break router mode - it MUST live in server-cors-proxy.h; (3) /tools is NOT an SSRF vector and is OUT OF SCOPE: its built-in tools are read_file/glob/grep/exec_shell_command/write_file/edit_file/get_datetime (server-tools.cpp:268-1031) and MCP runs over a stdio subprocess (server-mcp.h:94-125), with zero client-controlled outbound HTTP - this contradicts PLAN.md 8.1 and the previous description. DESIGN: new files server-ssrf.{h,cpp} own all logic; new --proxy-allowed-hosts CSV of hostnames and CIDRs; DENY-BY-DEFAULT (empty allowlist = every proxy request 403), with a compiled-in private/loopback/link-local/ULA/multicast/reserved block layered on top of hostname entries. DNS rebinding is closed by resolving with getaddrinfo, requiring EVERY resolved address to pass, then pinning the first via httplib ClientImpl::set_hostname_addr_map (httplib.h:2341, consumed at httplib.cpp:8911-8920 with AI_NUMERICHOST) so no re-resolve happens at connect; redirects are refused because create_redirect_client/setup_redirect_client (httplib.cpp:9630-9710) does NOT copy addr_map_. See docs/design/pr7-additional-hardening.md section 3.",
+      "status": "done",
+      "done_summary": "PR7 F014 verified: build clean on OpenSSL and no-OpenSSL; full auth regression 242/242 passed + 1 xfailed; proxy-SSRF allowlist, port-scoping, DNS-rebinding, self-target block, location-strip, and trusted-header denylist all green.",
+      "depends_on": [
+        "F002",
+        "F003"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr7-additional-hardening.md",
+      "files": [
+        "tools/server/server-ssrf.h",
+        "tools/server/server-ssrf.cpp",
+        "tools/server/server-cors-proxy.h",
+        "tools/server/server-models.h",
+        "tools/server/server-models.cpp",
+        "tools/server/server.cpp",
+        "tools/server/CMakeLists.txt",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py",
+        "tools/server/tests/unit/test_proxy.py"
+      ],
+      "acceptance_criteria": [
+        "all SSRF logic lives in the NEW files tools/server/server-ssrf.{h,cpp}; server-cors-proxy.h gains only the guard block plus the pinned-IP/no-redirect arguments, server.cpp gains only the server_ssrf::configure(params) call site next to server_auth::init, and server-models.{h,cpp} gain only the defaulted server_http_proxy_opts struct plus 3 lines in the ctor",
+        "ROUTER MODE UNBROKEN: server-models.cpp:1192 and :1826 (router -> child forwarding to CHILD_ADDR 127.0.0.1) are byte-identical apart from nothing - they pass no opts and get the defaults (pinned_ip empty, follow_location true). test_router.py passes unchanged with no --proxy-allowed-hosts set",
+        "/tools is UNCHANGED by this feature (no server-tools.cpp or server-mcp.cpp edit); the scope correction that /tools performs no client-controlled outbound HTTP is documented in the design",
+        "DENY BY DEFAULT: with --ui-mcp-proxy on and --proxy-allowed-hosts unset, GET and POST /cors-proxy to ANY target return 403 with body {\"error\":{\"message\":\"proxy target not allowed\",\"type\":\"proxy_target_denied\"}}; startup logs one SRV_WRN naming --proxy-allowed-hosts but does NOT abort",
+        "private-address block: with --proxy-allowed-hosts set to a HOSTNAME entry whose DNS answer is 127.0.0.1 (or 169.254.169.254, 10.x, 172.16-31.x, 192.168.x, ::1, fe80::/10, fc00::/7), the request is denied - a hostname entry can only reach public addresses",
+        "PORT-SCOPED ALLOWLIST (challenger B1-a): entry grammar is target[:portspec] where target is an IPv4/IPv6 literal, a CIDR, a bracketed IPv6 (mandatory when a port is present) or a hostname, and portspec is a decimal port or '*'. An entry with NO portspec permits ONLY ports 80 and 443. '--proxy-allowed-hosts 127.0.0.1/32' therefore does NOT reach 127.0.0.1:6379 or 127.0.0.1:8500; '--proxy-allowed-hosts 127.0.0.1/32:9000' reaches only port 9000. Each ':*' entry is accepted but logs one SRV_WRN at startup naming the entry",
+        "DNS-REBINDING/TOCTOU: the connection uses the exact IP that was validated. Verified by a test whose target hostname resolves to an allowed IP at check time and whose second resolution would differ (e.g. a stub resolver or /etc/hosts-style fixture), asserting the request still lands on the first IP; and by code inspection that server_http_proxy sets cli->set_hostname_addr_map({{host, pinned_ip}}) rather than passing a rewritten host string (Host header, SNI and certificate verification must still use the original hostname)",
+        "REDIRECT SUPPRESSION + LOCATION STRIP (challenger R-A4): /cors-proxy passes follow_location=false AND strip_location=true. A test target returning 302 Location: http://169.254.169.254/ causes status 302 to be relayed with the Location header REMOVED, and NO request is made to the redirect target. Rationale: the WebUI fetch() defaults to redirect:follow and resolves a relative Location against llama-server's own origin, so relaying Location lets an allowlisted-but-hostile target steer the operator's authenticated browser into same-origin requests. Router mode is unaffected (strip_location defaults false)",
+        "ALL resolved addresses must pass: a hostname resolving to one permitted and one blocked address is denied (not allowed by picking the good one)",
+        "the client-visible 403 body and status are IDENTICAL for every denial reason (not in allowlist / blocked range / resolve failure / bad port / bad hostname), so /cors-proxy is not an internal-network scanner or DNS-existence oracle; the specific reason appears only in an SRV_WRN server log line, which contains at most the requested host and port and NEVER a resolved internal IP",
+        "--proxy-allowed-hosts parse is fail-closed at startup: an unparseable entry, a /0 prefix (v4 or v6), a prefix wider than the family (/33 v4, /129 v6), or a hostname entry containing a non-ASCII or control byte, '/', '@', '\\\\', '?', '#', '[' or ']' each abort startup with SRV_ERR",
+        "hostname allowlist matching is exact and ASCII-case-insensitive after stripping at most one trailing dot; there is NO wildcard and NO suffix matching (evil-example.com must not match example.com, and sub.example.com must not match example.com)",
+        "IPv4-mapped IPv6 resolution results are unwrapped and evaluated against the IPv4 table, so a target resolving to ::ffff:169.254.169.254 is denied by 169.254.0.0/16",
+        "port sanity (challenger R-A3): a URL port outside 1..65535 is denied by the guard with the SAME 403 body as every other denial. Because common_http_parse_url does std::stoi (common/http.h:88) and throws std::out_of_range for e.g. ?url=http://h:99999999999/ (which ex_wrapper maps to 500), proxy_request MUST wrap the common_http_parse_url call in try/catch and return the identical 403 - no malformed URL may produce a 500",
+        "the guard is a SECOND, independent layer: a caller WITHOUT PERM_PROXY still gets the RBAC 403 before the guard runs, and a caller WITH PERM_PROXY still gets the guard 403 for a disallowed target (both assertions in the same test file)",
+        "the three existing tests that proxy to a private/external target are UPDATED (not deleted) to declare their target: test_proxy.py::test_mcp_proxy sets proxy_allowed_hosts=\"example.com\", test_proxy.py::test_mcp_proxy_custom_port and the test_security.py header-forwarding test (test_security.py:175-214) set proxy_allowed_hosts=\"127.0.0.1/32\"; test_proxy.py::test_mcp_no_proxy is unchanged",
+        "--proxy-allowed-hosts is threaded through tools/server/tests/utils.py::ServerProcess as proxy_allowed_hosts and is usable from a --config YAML file with no common/config.cpp change",
+        "builds clean with and without OpenSSL (server-ssrf.cpp must not require an SSL backend)",
+        "SELF-TARGET BLOCK, non-overridable (challenger B1-b): check_target denies, after S5 and regardless of any allowlist entry including ':*', when the target port equals the server's own listen port and the pinned address is loopback, the unspecified address, or a resolved address of params.hostname. Log reason 'self-target'. There is no flag to disable it. test_proxy.py::test_mcp_proxy_custom_port must be rewritten to proxy to a SEPARATE local HTTP fixture, not to the server's own port, and a new test asserts 403 for the self-target case",
+        "TRUSTED-HEADER DENYLIST (challenger B1-c): proxy_request's x-llama-server-proxy-header-* loop skips (case-insensitively) x-auth-subject, x-auth-roles, x-api-key, x-forwarded-for, x-forwarded-host, x-forwarded-proto, x-real-ip and forwarded. 'authorization' is deliberately NOT skipped. Test: with --auth-trusted-proxies 127.0.0.1/32 and an allowlist entry reaching a local echo fixture, a request carrying x-llama-server-proxy-header-x-auth-subject/-x-auth-roles results in an outbound request with NEITHER header present. This closes the PERM_PROXY -> admin escalation described in design section 7.1",
+        "startup cross-check warning (challenger B1-d): when --auth-trusted-proxies is non-empty AND /cors-proxy is enabled AND any allowlist entry could resolve into a trusted-proxy CIDR, exactly one SRV_WRN names both flags. Startup is NOT aborted",
+        "PIN FAMILY SELECTION (challenger R-A1): if the requested host was an IPv6 literal, or the answer contains only AAAA records, pin the first IPv6 result; otherwise pin the first IPv4 (or v4-mapped-unwrapped) result. This prevents a dual-stack host on an IPv6-less network from regressing, since set_hostname_addr_map accepts exactly one address and removes httplib's implicit try-each-address behaviour",
+        "EMBEDDED NUL (challenger R-A2): req.get_param('url') returns a percent-DECODED value, so %00 becomes a real NUL inside parsed_url.host. S3 runs BEFORE any allowlist comparison and before getaddrinfo; the length check uses host.size() and never strlen; NUL is rejected as a control byte. Test: ?url=http://127.0.0.1%2500.mcp.example/ (and the raw %00 form) returns the uniform 403 and no resolution is attempted",
+        "NEVER RESOLVE A NAME THAT CANNOT MATCH (challenger R-A6): getaddrinfo is called only when the request host parses as an IP literal OR exactly matches a hostname allowlist entry. An arbitrary caller-supplied hostname is denied before any DNS lookup, so /cors-proxy is not a DNS-existence oracle and a hostile resolver cannot hold an httplib worker thread open",
+        "PERM_PROXY /tools warning (challenger R-A7): when params.server_tools is non-empty AND auth is enabled, exactly one SRV_WRN states that /tools is gated by PERM_PROXY and that any role holding PERM_PROXY therefore has command execution via exec_shell_command. Note that -ag/--agent (common/arg.cpp:3377-3394) sets ui_mcp_proxy=true AND server_tools={'all'} together, so this is the default agent configuration, not an exotic one. The real fix (a distinct PERM_TOOLS bit) is a SEPARATE feature"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_proxy.py",
+        "tools/server/tests/unit/test_security.py"
+      ],
+      "notes": "Design complete, challenger review REQUIRED next (security_sensitive). docs/design/pr7-additional-hardening.md section 3 is the contract; open questions OQ-A1..OQ-A7 in section 3.10. Architect's default-policy recommendation is deny-by-default (allowlist required) rather than block-private-by-default, justified in section 3.2; this IS a breaking change for existing --ui-mcp-proxy users and for 3 tests in this repo (section 3.8). SEPARATE FINDING for the orchestrator to file as its own feature: /tools shares PERM_PROXY with /cors-proxy but exposes exec_shell_command (server-tools.cpp:581), write_file and read_file - a PERM_PROXY holder gets shell on the server host when --server-tools includes it. That is an RCE/LFI permission-model problem, strictly larger than SSRF, and is deliberately OUT OF SCOPE here (design section 3.9, OQ-A5). CHALLENGER PASS COMPLETE (design section 7): BLOCKER B1 found - allowlist entries had no port dimension and the design's own recommended remedy ('--proxy-allowed-hosts 127.0.0.1/32', design 3.2 point 3 and the 3.8 test updates) both re-opened full loopback SSRF and enabled a PERM_PROXY -> admin escalation by forwarding x-auth-subject/x-auth-roles to the server's own port from loopback while --auth-trusted-proxies covers loopback (server-auth.cpp:1178, server-http.cpp:266). Fixed by B1-a..B1-d, now acceptance criteria. Also binding: R-A1 pin-family selection, R-A2 embedded NUL, R-A3 stoi 500, R-A4 Location strip, R-A6 no-resolve-unless-matchable, R-A7 /tools warning. Verified against the tree: the set_hostname_addr_map + AI_NUMERICHOST + setup_redirect_client-does-not-copy-addr_map claims are all CORRECT; httplib never reads http_proxy from the env; CRLF path smuggling is already blocked by encode_path. Deny-by-default CONFIRMED (OQ-A1), strengthened by the finding that -ag/--agent enables /cors-proxy, not just --ui-mcp-proxy. All-must-pass CONFIRMED (OQ-A3).",
+      "reviewer_notes": "BLOCKER found and fixed directly: the B1-a port-scoped allowlist was implemented for hostname entries only - the cidr struct (server-ssrf.cpp) had no port field at all, so a CIDR/IP-literal allowlist entry with a portspec (e.g. '127.0.0.1/32:9000') was parsed but the port was silently discarded, and the S5 CIDR-match loop allowed ANY port on a matched address. This reopened the exact loopback-SSRF class B1-a exists to close ('127.0.0.1/32:9000' reached 127.0.0.1:6379/8500 just as before F014) and, combined with B1-b/B1-c being correct, would still have let a caller reach unrelated services on an allowlisted host at an unintended port. Fixed by adding cidr.port (default 0, matching hostname_entry.port's 0=80/443-only / -1=any / N=specific convention), setting it in parse_allowlist_entry for both the IPv4 and IPv6 CIDR branches, and enforcing it in both S5 match loops exactly like the hostname-entry branch. Rebuilt and confirmed 127.0.0.1/32:9000 no longer matches port 6379. SECOND defect found and fixed: server_http_proxy's ctor captured 'opts' (a const reference constructor parameter) BY REFERENCE into the response_handler lambda stored inside req, which the detached proxy thread captures by value and can still be running after the constructor returns (e.g. if the caller's should_stop fires before headers arrive) - a latent dangling-reference bug. Fixed by capturing the one bool it needs (derived from opts.follow_location, R-A4's Location-strip trigger) by value instead. Also added the missing R-A5 warning (--proxy-allowed-hosts set while /cors-proxy is not enabled) at server.cpp, which the design's section 7.3 marks binding but which was not carried into features.json's acceptance criteria and had been skipped. Everything else verified correct by code inspection: B1-b self-target block runs unconditionally after S5 regardless of allowlist scope including ':*'; B1-c's header denylist (x-auth-subject/x-auth-roles/x-api-key/x-forwarded-*/x-real-ip/forwarded, case-insensitive, authorization deliberately excluded) is applied in server-cors-proxy.h's header loop, closing the PERM_PROXY -> admin escalation by hand-trace; B1-d startup cross-check warning present; R-A1 IPv4-preference, R-A2 embedded-NUL rejection (checked on host.size(), not strlen), R-A3 stoi try/catch around common_http_parse_url, R-A4 Location-strip (implemented by coupling to follow_location rather than a separate strip_location field - functionally equivalent for the only two call sites that exist today, noted as a minor design-text deviation, not a defect), R-A6 never-resolve-unless-matchable, and R-A7 /tools warning are all present and correct. Deny-by-default confirmed (empty allowlist -> 403 for every target). Router-mode call sites (server-models.cpp:1192, :1826) pass no opts and are byte-identical. Builds clean with zero warnings on both the OpenSSL and no-OpenSSL (build-nossl) configs. Existing tests test_proxy.py::test_mcp_proxy, test_mcp_proxy_custom_port and test_security.py's header-forwarding test were about to regress under the new deny-by-default policy (no proxy_allowed_hosts set) and test_mcp_proxy_custom_port would additionally hit the new self-target block (it proxies to the server's own port) - fixed directly: added proxy_allowed_hosts to all three, rewrote test_mcp_proxy_custom_port to proxy to a separate local HTTP fixture (matching the pattern already used in test_security.py), and added test_mcp_proxy_no_allowlist_denied and test_mcp_proxy_self_target_denied. Not yet executed (no model available in this review pass) - test-runner must run tools/server/tests/unit/test_proxy.py and test_security.py before sign-off. F016-style CRL-reload-caliber load-bearing tests for the remaining criteria (embedded-NUL, mixed-A/AAAA-denies-all, IPv4-mapped-unwrap, hostname exact-match no-wildcard) still need to be written by test-planner against the acceptance criteria list. security_sensitive: challenger review already completed per the design doc section 7 and the existing feature notes (BLOCKER B1 found and fixed at the design stage); this review's two new findings are implementation-level regressions of that design, not new design gaps."
+    },
+    {
+      "id": "F015",
+      "stage": "PR7",
+      "title": "Prometheus auth metrics",
+      "description": "PLAN.md section 7 residual: the auth subsystem (F001-F013) has no metrics exposure, only the F006 audit file and SRV_* logging. Add three counter families to the EXISTING /metrics endpoint. ANCHOR CORRECTIONS (verified): (1) the Prometheus text is generated in server-context.cpp:4399-4502 (get_metrics), which lives in the server-context static lib (CMakeLists.txt:5-26) that does NOT link server-auth.cpp and IS linked standalone by test-chat (tests/CMakeLists.txt:163) - so server-context.cpp must gain ZERO server_auth:: references, exactly as F013's S3 required; (2) the existing exposition emits 'llamacpp:<name>' with a COLON and has no label support (server-context.cpp:4491-4493); (3) in router mode routes.get_metrics is reassigned to models_routes->proxy_get at server.cpp:205, so /metrics is a streaming proxy response there. DESIGN: counters are fixed-shape std::atomic arrays in server-auth.cpp beside the g_audit_* globals, incremented at the six existing audit_emit call sites in authorize_request (server-auth.cpp:1315/1340/1353/1371/1378/1389) plus the two JWKS outcomes in server-oidc.cpp::refresh_jwks (:250-280). The text is appended to whatever /metrics produced by a response wrapper in a NEW header-only file server-metrics.h, registered with ONE changed line at server.cpp:242, which covers both single-server and router mode. See docs/design/pr7-additional-hardening.md section 4.",
+      "status": "done",
+      "done_summary": "PR7 F015 verified: build clean on OpenSSL and no-OpenSSL; full auth regression 242/242 passed + 1 xfailed; auth metrics counters (failures, authz denial, JWKS refresh) working, no secrets in labels, no server-context.cpp changes.",
+      "depends_on": [
+        "F006"
+      ],
+      "security_sensitive": false,
+      "design_doc": "docs/design/pr7-additional-hardening.md",
+      "files": [
+        "tools/server/server-metrics.h",
+        "tools/server/server-auth.h",
+        "tools/server/server-auth.cpp",
+        "tools/server/server-oidc.h",
+        "tools/server/server-oidc.cpp",
+        "tools/server/server.cpp",
+        "tools/server/tests/unit/test_auth_metrics.py"
+      ],
+      "acceptance_criteria": [
+        "server-context.cpp is NOT modified and contains ZERO server_auth:: references; test-chat (which links the server-context static lib alone, tests/CMakeLists.txt:163) still links and runs",
+        "the only change in server.cpp is one #include \"server-metrics.h\" and wrapping the /metrics registration at server.cpp:242 in server_metrics_wrap(...); no other existing file gains auth-metrics logic",
+        "three counter families are exposed, exactly: llamacpp_auth_failures_total{auth_method,reason}, llamacpp_auth_authz_denied_total{auth_method,required_perm,reason}, llamacpp_auth_jwks_refresh_total{result}; label order within each metric is fixed and alphabetical as written",
+        "the families are DISJOINT by HTTP status: 400/401 decisions increment only llamacpp_auth_failures_total, 403 decisions increment only llamacpp_auth_authz_denied_total, and no single request increments both (unmapped_role is a reason label on the AUTHZ counter, deliberately deviating from the original feature text - design section 4.2 / OQ-B2)",
+        "reason label values for llamacpp_auth_failures_total are drawn only from the fixed set {malformed_path, no_credential, invalid_key, malformed, expired, aud_mismatch, introspect_denied, mtls_reject}; reason values for llamacpp_auth_authz_denied_total only from {unmapped_role, insufficient_perm}; result only from {success, failure}; auth_method only from auth_method_to_string() (none|api_key|trusted_proxy|mtls|oidc); required_perm only from perm_to_string()",
+        "NO label value is ever built from a request path, subject, API key, token, DN, header value or peer address. Verified by grep: every label value in the emitter is a string literal or a value returned by auth_method_to_string()/perm_to_string(), and no std::string from server_auth_request or server_auth_principal reaches the metrics text",
+        "counter increments occur ONLY immediately adjacent to the six existing audit_emit call sites in server_auth::authorize_request and at the success/failure returns of server-oidc.cpp::refresh_jwks; no authz condition is re-evaluated, duplicated or moved, and authorize_request's control flow and return values are byte-for-byte behaviourally identical",
+        "storage is fixed-size std::atomic<uint64_t> arrays indexed by enum (no std::map, no string keys, no mutex), so label cardinality is a compile-time property; total possible series <= 45 + 70 + 2",
+        "server_auth::metrics_prometheus() returns \"\" when auth is disabled, and in that mode GET /metrics output is byte-identical to pre-F015 (regression guard, must be a pytest)",
+        "the wrapper appends ONLY when the inner response has status 200 AND content_type starts with \"text/plain\"; a --metrics-disabled JSON error body and any non-text/plain proxied body are returned untouched with no Prometheus bytes appended (test: GET /metrics without --metrics returns valid JSON containing no 'llamacpp_auth_' substring)",
+        "router mode: with --metrics on, GET /metrics through a router returns the child's llamacpp:* metrics AND the router's llamacpp_auth_* counters in one text/plain body, delivered via the wrapped next() pump; the body is well-formed Prometheus text (every non-comment line matches name{labels} value)",
+        "each emitted family carries its # HELP and # TYPE lines; the two label-set families emit only series with value > 0, while llamacpp_auth_jwks_refresh_total emits BOTH success and failure series including zeros whenever OIDC is configured",
+        "functional counting tests: N bad API keys produce llamacpp_auth_failures_total{auth_method=\"api_key\",reason=\"invalid_key\"} == N; a valid principal denied on an admin route produces llamacpp_auth_authz_denied_total with the correct required_perm and reason=insufficient_perm; an authenticated principal whose roles map to no permission produces reason=unmapped_role; a request with a malformed path (%00 / '..' segment) produces reason=malformed_path with auth_method=none",
+        "/metrics itself remains gated by PERM_METRICS and by --metrics; an unauthorized caller cannot read the counters, and this constraint is stated in the flag/README documentation",
+        "no new CLI flag, no new route, no new dependency, no new thread",
+        "builds clean with and without OpenSSL; with OIDC not configured, server_oidc::jwks_refresh_counts returns zeros and the jwks family is omitted"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_auth_metrics.py"
+      ],
+      "notes": "Design complete. docs/design/pr7-additional-hardening.md section 4 is the contract; open questions OQ-B1..OQ-B6 in section 4.6. Two deliberate deviations from the original feature text, both flagged for review: metric names use the underscore prefix llamacpp_auth_* rather than the existing non-conforming llamacpp: prefix (OQ-B1), and unmapped_role is a reason label on the authz counter rather than the authn counter so the two families stay disjoint (OQ-B2). security_sensitive stays false (no auth-decision logic changes), but the no-raw-values rule in the acceptance criteria is the load-bearing check for the reviewer. CHALLENGER LIGHT PASS (design section 7.5): no-secrets-in-labels constraint verified sound as designed (all label values come from auth_method_to_string/perm_to_string or compile-time literals, storage is enum-indexed atomics). Two binding tweaks: perm_to_string() returns \"\" for a zero or multi-bit mask, so the emitter must map an empty result to the literal \"unknown\" and never to a numeric mask; and t_fail_reason must default to a distinct \"unknown\" reason rather than \"no_credential\" (OQ-B5 raised to binding) so a forgotten branch is visible instead of inflating the busiest bucket. OQ-B1 confirmed (underscore), OQ-B2 confirmed (disjoint by HTTP status is right), OQ-B3/B4/B6 accepted as designed.",
+      "reviewer_notes": "Status normalized from the coder's self-set 'in_review' (status transitions must come from reviewer/test-runner only). ONE defect found and fixed directly: metrics_prometheus()'s llamacpp_auth_jwks_refresh_total block was gated on 'jwks_success > 0 || jwks_failure > 0' rather than on whether JWKS-based OIDC is configured, so a freshly-started server with OIDC configured but zero refreshes attempted yet would omit the family entirely - violating the explicit acceptance criterion that both series (including zeros) are emitted whenever OIDC is configured and neither when it is not, and reintroducing the exact rate()-from-first-scrape problem section 4.5 calls out. Fixed by gating on g_oidc_enabled (the existing file-static flag already used at server-auth.cpp:1254) instead. Cross-coder check requested by the task (F014 and F015 both touch server-auth.h/.cpp): read the current, both-coders-applied state of both files fresh - no duplicate symbols, no stale-signature reliance either direction; server_auth::enabled() (added by F014 for the R-A7 warning) and the F015 counter/enum additions sit in disjoint regions with a single definition each. The g_auth_enabled OR-chain (server-auth.cpp:769: has_policy || has_api_keys || has_trusted_proxies || has_mtls || has_oidc || has_introspect) and its three downstream defensive asserts (has_mtls/has_oidc/has_introspect each require g_auth_enabled) are untouched by either coder. Everything else verified correct: the three counter families are exactly as specified with alphabetical label order; unmapped_role is on the authz-denied counter (not authn), disjoint by HTTP status, matching OQ-B2; storage is fixed-shape atomic arrays indexed by enum (AUTH_METHOD_COUNT=5, AUTH_FAIL_COUNT=9 incl. the binding 'unknown' default, PERM_INDEX_COUNT=6, AUTHZ_DENY_COUNT=2), no string-keyed maps; t_fail_reason defaults to AUTH_FAIL_UNKNOWN (not no_credential), matching the challenger's binding OQ-B5 change; all six counter increments sit immediately beside their audit_emit call sites and only under the same g_auth_enabled / status condition the audit line already uses, with authorize_request's control flow and returns unchanged. server-context.cpp re-grepped fresh: ZERO server_auth:: or server_metrics:: references (the only 'server_metrics' identifier there is the pre-existing, unrelated inference-stats struct). server-metrics.h's wrapper matches the design: appends only on status==200 and a text/plain content-type prefix, handles both the buffered and streaming (router-mode) response shapes, and streams the auth text on the final chunk only. No raw path/subject/token/key ever reaches a label - every label value traced to auth_method_to_string()/perm_to_string()/a compile-time literal. Builds clean on both the OpenSSL and no-OpenSSL configs. test_auth_metrics.py does not exist yet - out of scope for the coder/reviewer stages per the workflow, this is test-planner's next deliverable against the AC list; the family-disjointness, no-label-leak and router-mode-mixed-body behaviors above were verified by code inspection only, not by a live scrape in this pass. ADDENDUM (post test-planner defect): test-planner found that resolve_principal()'s three failure branches (JWT-shaped-but-invalid OIDC at ~1282, invalid API key at ~1317, introspection-denied at ~1352) set t_fail_reason but never set p.method away from its default AUTH_NONE before returning server_auth_principal{}, so both authn-fail increment sites (g_authn_fail[p.method][t_fail_reason]++ at ~1420/~1445) always recorded auth_method=\"none\" regardless of which method actually failed - violating the AC that N bad API keys produce auth_method=\"api_key\",reason=\"invalid_key\"==N. Fixed with a second thread_local, t_attempted_method (server-auth.cpp:70), reset to AUTH_NONE at the same entry point as t_fail_reason (line ~1211) and set to AUTH_OIDC / AUTH_API_KEY / AUTH_OIDC alongside each of the three t_fail_reason writes; both increment sites now read t_attempted_method instead of p.method. p.method itself is untouched (still AUTH_NONE for any failed/anonymous principal, preserving audit_emit and any other p.method reader's existing semantics) - this is a metrics-label-only fix, no change to authz decisions, return values, or audit output. Rebuilt clean (llama-server target, no new warnings). unit/test_auth_metrics.py: 10/10 passed. Broader regression (test_authz.py + test_trusted_proxy.py + test_audit.py + test_oidc.py): 100/100 passed, no new failures."
+    },
+    {
+      "id": "F016",
+      "stage": "PR7",
+      "title": "Runtime CRL reload (poll-based, last-known-good on failure)",
+      "description": "F010a residual (OQ-A2, accepted at the time): --mtls-crl-file is loaded once in server-mtls.cpp::load_crl_file (:93-149) via harden_context (:153-194, called from server-http.cpp:154), so rotating a CRL requires a restart. CORRECTION to the task framing: SIGHUP does NOT avoid a worker thread - a signal handler may not open a file, allocate, call OpenSSL or take a mutex, so every correct trigger needs a servicing thread. Given the thread is unavoidable, the design picks a periodic re-stat-and-reload POLL behind a new --mtls-crl-reload-interval SECONDS flag (default 0 = disabled, preserving F010a behaviour exactly), because it needs no change to server.cpp's shared signal handler (server.cpp:26-38, 485-490, assigned in two places at :426 and :475), works on Windows, works with an automated CRL cron, and has zero rebase exposure. CORRECTION on OpenSSL: there is NO safe pointer swap. SSL_CTX_set_cert_store frees the old store and writes a raw pointer that an in-flight X509_STORE_CTX holds without a reference (use-after-free), and add-only X509_STORE_add_crl accumulates stale CRLs that OpenSSL's get_crl_sk can prefer over the fresh one (fail-open). The design instead installs X509_STORE_set_lookup_crls ONCE at startup and swaps only our own shared_ptr snapshot under our own mutex; the callback returns a fresh, up-reffed STACK_OF(X509_CRL) that the caller owns, so there is no cross-thread lifetime question. F010a's X509_STORE_add_crl calls are KEPT as a safety net so a wrong assumption degrades to 'reload is a no-op', never to lost revocation. Bad reload = keep the last-known-good CRL and log SRV_ERR (not abort). See docs/design/pr7-additional-hardening.md section 5.",
+      "status": "done",
+      "done_summary": "PR7 F016 verified: build clean on OpenSSL and no-OpenSSL; full auth regression 242/242 passed + 1 xfailed; CRL poll-reload with last-known-good fallback, session-resumption suppression, callback robustness, and flag validation all green.",
+      "depends_on": [
+        "F010a"
+      ],
+      "security_sensitive": true,
+      "design_doc": "docs/design/pr7-additional-hardening.md",
+      "files": [
+        "tools/server/server-mtls.h",
+        "tools/server/server-mtls.cpp",
+        "tools/server/server-http.cpp",
+        "common/common.h",
+        "common/arg.cpp",
+        "tools/server/tests/utils.py",
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "acceptance_criteria": [
+        "all reload logic lives in tools/server/server-mtls.cpp; the new flag in common/arg.cpp and its field in common/common.h are the only other existing-file changes. Per challenger R-C3 the server_http_context::stop() call site is DROPPED: after R-C2 crl_reload_stop() only silences log lines during the last second of shutdown of a detached thread nobody waits on, and removing it removes F016's only touch of an upstream-owned source file",
+        "NO REGRESSION when reload is off: with --mtls-crl-reload-interval unset or 0, behaviour is identical to F010a - the existing test_mtls.py CRL revocation, expiry, multiple-CRL and flag-validation tests pass unmodified",
+        "F010a's validation is written ONCE: load_crl_file is refactored into crl_parse_file (parse + R1 nextUpdate-present and nextUpdate-not-past checks + count>=1) plus a thin add-to-store wrapper, and the reload path calls the SAME crl_parse_file - a reloaded CRL with no nextUpdate, with a past nextUpdate, that is unparseable, or that contains zero CRLs is rejected by identical logic",
+        "CALLBACK IS ACTUALLY CONSULTED (the load-bearing test): start with CRL v1 revoking nothing, confirm client cert C connects; overwrite the file with CRL v2 revoking C; after interval + slack, C's TLS HANDSHAKE FAILS. This proves the lookup callback beats the store-resident v1 CRL. An unrevoked cert D from the same CA still succeeds in the same run",
+        "BAD RELOAD KEEPS LAST-KNOWN-GOOD: after the step above, overwrite the file with garbage; after interval + slack the server is STILL RUNNING, C is STILL rejected, D still succeeds, and exactly one SRV_ERR was logged naming the failure. The bad file NEVER becomes the active CRL and revocation is never silently disabled",
+        "IN-FLIGHT CONNECTIONS SURVIVE: an established mTLS connection (e.g. a long SSE stream) started before a reload is not closed, reset or re-verified by the reload; only handshakes starting after the swap see the new CRL set. Asserted by a test that holds a stream open across a reload",
+        "the reload thread NEVER touches an SSL_CTX, X509_STORE or httplib object after startup - it only parses a file and swaps a shared_ptr under a mutex. Verified by code inspection; this is what makes its lifetime independent of the HTTP server's",
+        "no CRL is added to or removed from the SSL_CTX store after startup, and SSL_CTX_set_cert_store / SSL_CTX_set1_cert_store are NOT called anywhere (the rejected, unsafe mechanisms - design section 5.3)",
+        "NO 'SAFETY NET' CLAIM (challenger B2): installing X509_STORE_set_lookup_crls REPLACES the store's CRL lookup - the add_crl'd CRLs are reachable ONLY through the default lookup_crls (X509_STORE_CTX_get1_crls), which the custom callback overwrites, so after F016 they are inert. The degenerate failure mode of a broken callback is X509_V_ERR_UNABLE_TO_GET_CRL on every handshake, i.e. FAIL-CLOSED, not 'reload is a no-op'. Instead of a net, bind a real assertion: immediately after X509_STORE_set_lookup_crls, verify X509_STORE_get_lookup_crls(store) == crl_lookup_cb and SRV_ERR + return false if not. The design text and this criterion's previous wording were both wrong and must not be reintroduced",
+        "the callback returns an EMPTY STACK_OF(X509_CRL) (never nullptr) when the snapshot is empty or no issuer matches, so OpenSSL reports X509_V_ERR_UNABLE_TO_GET_CRL and the handshake fails closed; the callback never throws and never logs",
+        "FLAG VALIDATION, all fail closed at startup with SRV_ERR: --mtls-crl-reload-interval negative; value 1..4 (minimum is 5, to prevent a hot stat loop); non-zero with an empty --mtls-crl-file; and on a build without OpenSSL 3.0+ (BoringSSL / LibreSSL / OpenSSL 1.1.x) the flag aborts startup rather than being silently ignored",
+        "change detection uses the (mtime, size) pair, not mtime alone. The (mtime, size) memo controls whether we RE-PARSE; it must NOT control whether we RE-WARN (challenger R-C4)",
+        "EXPIRY WARNINGS + PERSISTENT-FAILURE VISIBILITY (challenger R-C4, closes OQ-C1's real gap): on every tick the active snapshot's earliest nextUpdate is checked - SRV_WRN under 24h, SRV_ERR once passed ('all mTLS handshakes will fail'), each rate-limited to once per hour. ADDITIONALLY, a failed reload is re-logged at SRV_ERR once per hour for as long as the active snapshot is older than the on-disk file (NOT once per distinct (mtime,size), which would announce a permanently broken reload exactly once and then never again). Track consecutive_failures and last_success_unix; after 24h with no successful reload the message escalates and names the flag and the file",
+        "crl_reload_stop() (challenger R-C2) is a single std::atomic<bool> store and NOTHING else - no mutex, no condition_variable, no notify. The reload thread sleeps in 1-second increments and re-checks the flag. Rationale: server_http_context::stop() is reachable from the signal-delivery path (server.cpp:26-38) and condition_variable::notify_one locks, so it is no more async-signal-safe than pthread_join. The thread stays detached and touches only intentionally-leaked file-scope statics",
+        "DOCUMENTATION: the sentence 'A CRL is loaded once at startup; rotating the CRL requires restarting the server.' in the --mtls-crl-file help (common/arg.cpp:3545) is replaced, and the new --mtls-crl-reload-interval help states the last-known-good-on-failure policy explicitly",
+        "--mtls-crl-reload-interval is threaded through tools/server/tests/utils.py::ServerProcess and is usable from a --config YAML file with no common/config.cpp change",
+        "builds clean with and without OpenSSL (the no-OpenSSL harden_context #else path still fails closed) and with zero new warnings",
+        "SESSION RESUMPTION DISABLED (challenger R-C1, the real hole in F016): a resumed TLS session does NOT re-run chain verification - OpenSSL restores the stored peer cert and verify result - so a revoked client keeps connecting on new TCP connections for the ticket/session lifetime, defeating the entire point of a timely reload. When cfg.enabled && cfg.crl_reload_interval > 0, harden_context also calls SSL_CTX_set_session_cache_mode(c, SSL_SESS_CACHE_OFF), SSL_CTX_set_options(c, SSL_OP_NO_TICKET) and SSL_CTX_set_num_tickets(c, 0), with one SRV_INF explaining why. TEST: a client revoked by the reloaded CRL that reconnects presenting a previously-issued session ticket is REJECTED",
+        "SINGLE STARTUP PARSE (challenger B2-c): crl_parse_file is called EXACTLY ONCE at startup. load_crl_file is rewritten to take the already-parsed snapshot and only add it to the store plus set X509_V_FLAG_CRL_CHECK|CRL_CHECK_ALL; the same snapshot object is published via crl_set. Design section 5.6's two separate parses (step 1 and step 2b) are a TOCTOU: a rotation between them can leave the store and the snapshot holding different files, or leave an EMPTY snapshot on a server that started 'successfully' and then fails every handshake. A parse failure at startup aborts, unchanged from F010a",
+        "CALLBACK ROBUSTNESS (challenger R-C5): crl_lookup_cb's whole body is wrapped in try{...}catch(...){ return nullptr; }; a NULL from sk_X509_CRL_new_null() returns NULL; a failed sk_X509_CRL_push X509_CRL_free's the CRL it just up-reffed (otherwise the reload leaks one CRL per handshake). Both nullptr and an empty stack produce fail-closed verification",
+        "the reload path never calls X509_STORE_set_flags or any other X509_STORE mutator (challenger R-C6); flags are set exactly once, by the startup add-to-store step",
+        "DOCUMENTATION (challenger R-C7): the --mtls-crl-reload-interval help states in one sentence that --mtls-client-ca-file is still loaded once at startup, so nobody infers general hot-reload of mTLS config; and it repeats design section 0's advice to prefer short-lived certificates when there is no real CRL distribution point",
+        "CRL FRESHNESS IS OBSERVABLE (challenger R-C4): server_mtls exposes crl_stats(uint64_t & reload_failures, int64_t & last_success_unix, int64_t & earliest_next_update). server-mtls.cpp and server-auth.cpp are in the same static lib (tools/server/CMakeLists.txt:38-54), so IF F015 ships, its emitter appends llamacpp_mtls_crl_reload_failures_total, llamacpp_mtls_crl_last_success_timestamp_seconds and llamacpp_mtls_crl_next_update_timestamp_seconds - three unlabelled series, no cardinality risk. If F015 does not ship, the hourly re-log stands alone and the flag help must say so"
+      ],
+      "test_refs": [
+        "tools/server/tests/unit/test_mtls.py"
+      ],
+      "notes": "Design complete, challenger review REQUIRED next (security_sensitive). docs/design/pr7-additional-hardening.md section 5 is the contract; open questions OQ-C1..OQ-C7 in section 5.10. Two architect decisions the challenger should attack hardest: (a) bad reload keeps the last-known-good CRL and logs SRV_ERR rather than aborting, justified in 5.4 on the grounds that aborting hands a DoS to anyone who can write the CRL file (OQ-C1); (b) the X509_STORE_set_lookup_crls mechanism in 5.3 rests on X509_STORE_CTX_init propagating the store's lookup_crls into the per-verification context and get_crl_delta preferring it over the store - confirm there is no path where the store-resident old CRL wins over the callback's new one, which would be a fail-open (OQ-C3). The startup add_crl safety net plus the 'revoked only in v2' test are the two guards against that assumption being wrong. CHALLENGER PASS COMPLETE (design section 7): BLOCKER B2 found - the 'X509_STORE_add_crl safety net' does not exist. There is one lookup_crls slot per store; the store-resident add_crl'd CRLs are reachable ONLY via the default X509_STORE_CTX_get1_crls, which the custom callback replaces, so they become inert. Answering OQ-C3 directly: OpenSSL does NOT consult both sources, and there is therefore NO path where the store-resident v1 CRL beats the callback's v2 CRL (no fail-open) - but neither is there a net, and a broken callback yields X509_V_ERR_UNABLE_TO_GET_CRL on every handshake, which is fail-CLOSED. The MECHANISM is sound; only the risk narrative was wrong. Also binding: R-C1 session-resumption bypass (the substantive security gap - a resumed session skips chain verification entirely, so revocation does not take effect until tickets expire), B2-b lookup_crls install assertion, B2-c single startup parse, R-C2 signal-safe stop, R-C3 drop the server-http.cpp call site, R-C4 persistent-failure visibility and CRL freshness gauges, R-C5 callback robustness. OQ-C1 resolved: last-known-good is CORRECT policy, but the alerting was NOT adequate and R-C4 fixes it. Verified: the OpenSSL 3.x lookup_crls signature is (const X509_STORE_CTX *, const X509_NAME *) per x509_vfy.h:271-273, and harden_context runs exactly once at startup (server-http.cpp:154) so the thread cannot be started twice.",
+      "reviewer_notes": "No implementation defects found beyond one build-cleanliness issue, fixed directly: server-mtls.cpp's expiry-warning log used '%ld' with an int64_t argument (long long on this platform's LP64 ABI where int64_t is 'long long', not 'long'), producing a real new -Wformat warning on a from-scratch rebuild (confirmed by touching the F014/F015/F016 sources and rebuilding verbosely - the cached build had hidden it). Fixed by casting to (long long) and using %lld; both the OpenSSL and no-OpenSSL (build-nossl) configs now rebuild with zero new warnings. Everything else verified correct against the BINDING section 7.2/7.4 revisions, not the earlier (wrong) 5.3 safety-net narrative: B2-a/b confirmed - the design text was already corrected in the code comments (no leftover 'safety net' claim), and harden_context asserts X509_STORE_get_lookup_crls(store) is non-null immediately after X509_STORE_set_lookup_crls, SRV_ERR + return false otherwise. B2-c single startup parse confirmed: crl_parse_file is called exactly once in harden_context, the resulting snapshot is passed to load_crl_snapshot_to_store (add-to-store only, no re-parse) and separately published via crl_set for the reload thread - no TOCTOU between two independent parses. X509_STORE_set_flags is called exactly once (R-C6), never from the reload path. R-C1 session resumption: SSL_CTX_set_session_cache_mode(OFF)/SSL_OP_NO_TICKET/SSL_CTX_set_num_tickets(0) (version-guarded on OPENSSL_VERSION_NUMBER) are applied only inside the cfg.crl_reload_interval > 0 branch, confirmed NOT applied when reload is off (F010a's original session behavior is unaffected). R-C2 crl_reload_stop() is a single atomic bool store, no mutex or condition_variable, matching the signal-path-safety requirement; R-C3's recommended simplification was taken further than 'keep it': grepped server-http.cpp/server.cpp fresh and confirmed the stop() call site was dropped entirely (crl_reload_stop() is defined but never called), so F016 makes zero changes to any pre-existing upstream file. R-C4 persistent-failure visibility present (consecutive_failures/last_success_unix tracked, hourly rate-limited re-log while the on-disk file is newer than the last success, 24h escalation naming the flag) - though the expiry-warning, expiry-error and persistent-failure-re-log branches share one last_warn_time timestamp, so at most one of the three fires per hour rather than each independently; not a fail-open (still fires at least hourly) so not blocking, but worth tightening if an operator reports a suppressed message. R-C5 callback robustness confirmed: crl_lookup_cb is wrapped in try/catch, a failed sk_X509_CRL_push frees the just-up-reffed CRL, and both nullptr and an empty stack are fail-closed outcomes. crl_stats() exposes reload_failures/last_success_unix/earliest_next_update as the design specifies for a future F015 gauge (not wired into F015 in this pass - F015's metrics_prometheus() does not yet emit the three llamacpp_mtls_crl_* series; flagging as a follow-up, not a blocker since the design marks it conditional on 'if F015 ships'). Flag validation (negative, 1..4, non-zero with empty --mtls-crl-file, non-OpenSSL-3.0+ build) all fail closed with SRV_ERR. Help text for both --mtls-crl-file and --mtls-crl-reload-interval updated per R-C7 (no stale 'requires restart' claim, states the last-known-good policy and that --mtls-client-ca-file remains load-once). --mtls-crl-reload-interval threaded through tests/utils.py. security_sensitive: challenger review already completed per the design doc section 7 (BLOCKER B2 found and fixed at the design stage); no new design-level gap found in this pass. Test gap: test_mtls.py has no CRL-reload-specific tests at all yet (the load-bearing 'callback is actually consulted' test from design 5.8, the last-known-good-on-garbage test, the in-flight-connection survival test, and the session-resumption rejection test are all still to be written) - this is test-planner's next deliverable, not fixed in this pass."
+    }
+  ]
+}

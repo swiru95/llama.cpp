@@ -28,6 +28,17 @@ from typing import (
 from re import RegexFlag
 import wget
 
+# F008a: the mTLS tests intentionally connect with verify=False (no CA pinned on the client
+# side, or verify=<ca_cert path> when a CA is provided) to test the server's client-cert
+# enforcement rather than the test client's server-cert trust. Suppress the resulting
+# urllib3 InsecureRequestWarning noise; this never disables verification when a ca_cert path
+# is actually passed (verify=<path> is untouched by this call).
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
+
 
 DEFAULT_HTTP_TIMEOUT = 60
 
@@ -89,6 +100,37 @@ class ServerProcess:
     server_slots: bool | None = False
     pooling: str | None = None
     api_key: str | None = None
+    config_file: str | None = None
+    auth_policy_file: str | None = None
+    proxy_allowed_hosts: str | None = None  # F014: /cors-proxy allowlist
+    auth_audit_log: str | None = None
+    auth_trusted_proxies: str | None = None
+    ssl_file_cert: str | None = None
+    ssl_file_key: str | None = None
+    mtls_client_ca_file: str | None = None
+    mtls_client_ca_dir: str | None = None
+    mtls_required: str | None = None
+    mtls_verify_depth: int | None = None
+    tls_min_version: str | None = None
+    mtls_crl_file: str | None = None
+    mtls_crl_reload_interval: int | None = None
+    oidc_issuer: str | None = None
+    oidc_jwks_url: str | None = None
+    oidc_audience: str | None = None
+    oidc_algs: str | None = None
+    oidc_ca_file: str | None = None
+    oidc_clock_skew: int | None = None
+    oidc_introspection_url: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret_file: str | None = None
+    # F008a/test harness: the TEST CLIENT's own cert/key (presented to the server) and the
+    # CA the test client trusts to verify the server's cert. These are NOT server flags and
+    # are never appended to server_args; they only affect how make_request/make_stream_request
+    # talk to the server. When ssl_file_cert is unset, none of this is used (plain http://,
+    # unchanged behavior for the existing HTTP test suites).
+    client_cert: str | None = None
+    client_key: str | None = None
+    ca_cert: str | None = None
     models_dir: str | None = None
     models_max: int | None = None
     models_preset: str | None = None
@@ -231,8 +273,54 @@ class ServerProcess:
             server_args.append("--context-shift")
         if self.spec_type:
             server_args.extend(["--spec-type", self.spec_type])
+        if self.config_file:
+            server_args.extend(["--config", self.config_file])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
+        if self.auth_policy_file:
+            server_args.extend(["--auth-policy-file", self.auth_policy_file])
+        if self.auth_audit_log:
+            server_args.extend(["--auth-audit-log", self.auth_audit_log])
+        if self.auth_trusted_proxies:
+            server_args.extend(["--auth-trusted-proxies", self.auth_trusted_proxies])
+        if self.proxy_allowed_hosts:
+            server_args.extend(["--proxy-allowed-hosts", self.proxy_allowed_hosts])
+        if self.ssl_file_cert:
+            server_args.extend(["--ssl-cert-file", self.ssl_file_cert])
+        if self.ssl_file_key:
+            server_args.extend(["--ssl-key-file", self.ssl_file_key])
+        if self.mtls_client_ca_file:
+            server_args.extend(["--mtls-client-ca-file", self.mtls_client_ca_file])
+        if self.mtls_client_ca_dir:
+            server_args.extend(["--mtls-client-ca-dir", self.mtls_client_ca_dir])
+        if self.mtls_required:
+            server_args.extend(["--mtls-required", self.mtls_required])
+        if self.mtls_verify_depth is not None:
+            server_args.extend(["--mtls-verify-depth", str(self.mtls_verify_depth)])
+        if self.tls_min_version:
+            server_args.extend(["--tls-min-version", self.tls_min_version])
+        if self.mtls_crl_file:
+            server_args.extend(["--mtls-crl-file", self.mtls_crl_file])
+        if self.mtls_crl_reload_interval is not None:
+            server_args.extend(["--mtls-crl-reload-interval", str(self.mtls_crl_reload_interval)])
+        if self.oidc_issuer:
+            server_args.extend(["--oidc-issuer", self.oidc_issuer])
+        if self.oidc_jwks_url:
+            server_args.extend(["--oidc-jwks-url", self.oidc_jwks_url])
+        if self.oidc_audience:
+            server_args.extend(["--oidc-audience", self.oidc_audience])
+        if self.oidc_algs:
+            server_args.extend(["--oidc-algs", self.oidc_algs])
+        if self.oidc_ca_file:
+            server_args.extend(["--oidc-ca-file", self.oidc_ca_file])
+        if self.oidc_clock_skew is not None:
+            server_args.extend(["--oidc-clock-skew", str(self.oidc_clock_skew)])
+        if self.oidc_introspection_url:
+            server_args.extend(["--oidc-introspection-url", self.oidc_introspection_url])
+        if self.oidc_client_id:
+            server_args.extend(["--oidc-client-id", self.oidc_client_id])
+        if self.oidc_client_secret_file:
+            server_args.extend(["--oidc-client-secret-file", self.oidc_client_secret_file])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
         if self.spec_draft_n_min:
@@ -342,6 +430,22 @@ class ServerProcess:
         if hasattr(self, '_log') and self._log != sys.stdout:
             self._log.close()
 
+    def _base_url(self) -> str:
+        scheme = "https" if self.ssl_file_cert else "http"
+        return f"{scheme}://{self.server_host}:{self.server_port}"
+
+    def _tls_kwargs(self) -> dict:
+        # Backward-compat (F008a): when the server is plain HTTP (the default, and every
+        # existing test), self.ssl_file_cert is None and this returns {} so the requests.*
+        # calls below are byte-identical to before this change - no verify/cert kwargs at
+        # all. Only an HTTPS-configured ServerProcess (ssl_file_cert set) gets TLS kwargs.
+        if not self.ssl_file_cert:
+            return {}
+        kwargs: dict = {"verify": self.ca_cert if self.ca_cert else False}
+        if self.client_cert and self.client_key:
+            kwargs["cert"] = (self.client_cert, self.client_key)
+        return kwargs
+
     def make_request(
         self,
         method: str,
@@ -350,19 +454,20 @@ class ServerProcess:
         headers: dict | None = None,
         timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     ) -> ServerResponse:
-        url = f"http://{self.server_host}:{self.server_port}{path}"
+        url = f"{self._base_url()}{path}"
+        extra = self._tls_kwargs()
         parse_body = False
         if method == "GET":
-            response = requests.get(url, headers=headers, timeout=timeout)
+            response = requests.get(url, headers=headers, timeout=timeout, **extra)
             parse_body = True
         elif method == "POST":
-            response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            response = requests.post(url, headers=headers, json=data, timeout=timeout, **extra)
             parse_body = True
         elif method == "DELETE":
-            response = requests.delete(url, headers=headers, timeout=timeout)
+            response = requests.delete(url, headers=headers, timeout=timeout, **extra)
             parse_body = True
         elif method == "OPTIONS":
-            response = requests.options(url, headers=headers, timeout=timeout)
+            response = requests.options(url, headers=headers, timeout=timeout, **extra)
         else:
             raise ValueError(f"Unimplemented method: {method}")
         result = ServerResponse()
@@ -385,9 +490,10 @@ class ServerProcess:
         data: dict | None = None,
         headers: dict | None = None,
     ) -> Iterator[dict]:
-        url = f"http://{self.server_host}:{self.server_port}{path}"
+        url = f"{self._base_url()}{path}"
+        extra = self._tls_kwargs()
         if method == "POST":
-            response = requests.post(url, headers=headers, json=data, stream=True)
+            response = requests.post(url, headers=headers, json=data, stream=True, **extra)
         else:
             raise ValueError(f"Unimplemented method: {method}")
         if response.status_code != 200:

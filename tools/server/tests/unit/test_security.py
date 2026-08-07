@@ -191,6 +191,9 @@ def test_cors_proxy_only_forwards_explicit_proxy_headers():
         server = ServerPreset.tinyllama2()
         server.api_key = TEST_API_KEY
         server.ui_mcp_proxy = True
+        # F014: deny-by-default now requires the target to be explicitly allowlisted, with the
+        # port spelled out (no portspec would only permit 80/443, not this fixture's port).
+        server.proxy_allowed_hosts = f"127.0.0.1/32:{target.server_port}"
         server.start()
 
         res = server.make_request("GET", f"/cors-proxy?url=http://127.0.0.1:{target.server_port}/capture", headers={
