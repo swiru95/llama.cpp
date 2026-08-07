@@ -1,27 +1,27 @@
 # Installed to /etc/llama-server/config.yaml by install.sh (not overwritten on
 # re-install if it already exists there - edit the live copy, not this file).
 #
+# DO NOT put port / models-preset / models-max / models-autoload / api-key
+# here. The router hands its own --config argument down to every spawned
+# child verbatim, and each child re-parses this file independently from
+# scratch - so a router-only key here would make every child think it
+# should also be a router and spawn two more children, recursively,
+# without bound. Those settings live directly on the systemd unit's
+# ExecStart line (llama-server.service) instead, where they get correctly
+# stripped before being handed to children. This file is only for settings
+# that ARE fine (or even desirable) to also apply identically to every
+# spawned model instance.
+#
 # See docs: --config loads any documented server flag from YAML; this fork
 # adds an optional inline `auth_policy:` block for RBAC (see PLAN.md / README).
-
-port: 8080
-
-# Router mode: which models are available and how many stay loaded at once.
-# The actual model list lives in models.ini alongside this file.
-models-preset: /etc/llama-server/models.ini
-models-max: 2
-models-autoload: true
-
-# CHANGE THIS before starting the service. Generate a real key with:
-#   openssl rand -hex 32
-api-key: "sk-CHANGE-ME-before-starting"
 
 # JSON-lines audit log: one line per non-public request, hashed subject,
 # never a raw key/token. See docs/design/pr2-principal-proxy.md.
 auth-audit-log: /var/log/llama-server/audit.jsonl
 
-# Uncomment and fill in to require RBAC roles instead of the single flat
-# --api-key above (each key mapped to a role - no key here means deny):
+# Uncomment and fill in to require RBAC roles instead of the flat
+# --api-key-file the unit already sets (each key mapped to a role - a key
+# with no entry here is denied, not silently admitted):
 #
 # auth_policy:
 #   roles:

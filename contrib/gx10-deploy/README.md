@@ -12,8 +12,10 @@ cmake --build build --target llama-server -j$(nproc)
 sudo contrib/gx10-deploy/install.sh
 ```
 
-Then edit `/etc/llama-server/config.yaml` (the API key placeholder must be
-changed) and `/etc/llama-server/models.ini` (which models to serve), and:
+The API key is generated automatically (printed once at the end of
+install.sh, also saved at `/etc/llama-server/api.key`). Edit
+`/etc/llama-server/models.ini` if you want different models than the
+Qwen3-Coder / Qwen3-32B example, then:
 
 ```sh
 sudo systemctl enable --now llama-server
@@ -41,6 +43,26 @@ sudo systemctl restart llama-server
   group membership, not broad device access).
 - `config.yaml.example`, `models.ini.example` - copied to `/etc/llama-server/`
   on first install only.
+
+## IMPORTANT: what can and cannot go in config.yaml
+
+`llama-server`'s router mode passes its own `--config` argument down to
+every model instance it spawns, verbatim, and each instance re-parses that
+file completely independently. Anything in `config.yaml` that identifies
+the process as a *router* - `port`, `models-preset`, `models-max`,
+`models-autoload`, `api-key` - will therefore also be picked up by every
+spawned child, which will then *also* decide it's a router and spawn two
+more children. Recursively. Unbounded. This is not hypothetical: it is
+exactly what happens if you put those keys in `config.yaml`, confirmed by
+running it.
+
+Those five settings live directly on the `ExecStart` line in
+`llama-server.service` instead (as CLI flags, which the router correctly
+strips before rendering a child's arguments - only a re-read *file*
+defeats that stripping). `config.yaml` is for settings that are fine, or
+even desirable, to also apply identically to every spawned instance:
+`auth-audit-log`, `auth_policy`, `oidc-*`, `mtls-*`. Do not add
+`port`/`models-preset`/`models-max`/`models-autoload`/`api-key` to it.
 
 ## Notes
 
