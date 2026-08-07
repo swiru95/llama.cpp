@@ -19,6 +19,15 @@ Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
 # to anonymous access. A unit-file Environment= for a key always wins over
 # the inherited system default for that same key.
 Environment=HF_TOKEN=
+# Same reasoning, different mechanism: MODEL_ENDPOINT/HF_ENDPOINT
+# (common_get_model_endpoint, common/common.cpp) override the default
+# https://huggingface.co/ base URL, and common_http_client (common/http.h)
+# sends any userinfo embedded in that URL as HTTP Basic Auth. An ambient
+# override pointing at an internal mirror with stale embedded credentials
+# would produce exactly this failure mode and would NOT be fixed by
+# pinning HF_TOKEN alone, since it is a completely separate code path.
+Environment=MODEL_ENDPOINT=
+Environment=HF_ENDPOINT=
 
 # Router-identity flags (models-preset/models-max/models-autoload/port/
 # api-key) MUST be given here on the command line, never inside the
