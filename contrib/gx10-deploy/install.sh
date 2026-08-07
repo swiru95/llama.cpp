@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+trap 'echo "" >&2; echo "*** install.sh FAILED (see error above) - installed files may be a stale/partial mix, do NOT assume this succeeded. Fix the error and re-run before starting/restarting the service. ***" >&2' ERR
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "error: run as root (sudo $0)" >&2
     exit 1
@@ -48,6 +50,18 @@ for grp in video render; do
     fi
 done
 
+# Stop the service BEFORE touching the binary. A plain `cp` onto a file a
+# running process has mapped fails with "Text file busy" on Linux - and
+# under `set -e` that aborts this whole script right there, silently
+# skipping every later step including refreshing the systemd unit. This
+# bit an actual deploy: install.sh crashed on this exact cp, so a unit
+# change (env var pins) was never installed, and every subsequent restart
+# kept running the stale unit while the real fix sat un-applied.
+if systemctl is-active --quiet llama-server 2>/dev/null; then
+    echo "==> stopping running llama-server service before replacing binaries"
+    systemctl stop llama-server
+fi
+
 echo "==> binaries -> $INSTALL_PREFIX/bin"
 # Copying build/bin/ wholesale (the binary plus every .so it already links
 # against, in the exact layout that has been running successfully from the
@@ -56,8 +70,22 @@ echo "==> binaries -> $INSTALL_PREFIX/bin"
 # silently drop a runtime dependency that only surfaces as a linker error
 # at service start. The unit's LD_LIBRARY_PATH covers this regardless of
 # how each .so's RPATH was set at link time.
-mkdir -p "$INSTALL_PREFIX/bin"
-cp -a "$BUILD_BIN/." "$INSTALL_PREFIX/bin/"
+#
+# Built in a fresh temp directory and swapped in via `mv` (atomic rename on
+# the same filesystem) rather than copied in place, as a second layer under
+# the stop-first step above: a lingering child process (a spawned model
+# instance, or a manual run outside systemd) can still hold the old files
+# open, and rename does not require the destination to be writable while
+# mapped the way an in-place write does.
+rm -rf "$INSTALL_PREFIX/bin.new"
+mkdir -p "$INSTALL_PREFIX/bin.new"
+cp -a "$BUILD_BIN/." "$INSTALL_PREFIX/bin.new/"
+if [ -d "$INSTALL_PREFIX/bin" ]; then
+    rm -rf "$INSTALL_PREFIX/bin.old"
+    mv "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/bin.old"
+fi
+mv "$INSTALL_PREFIX/bin.new" "$INSTALL_PREFIX/bin"
+rm -rf "$INSTALL_PREFIX/bin.old"
 
 echo "==> $CONFIG_DIR, $DATA_DIR, $LOG_DIR"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR/cache" "$LOG_DIR"
