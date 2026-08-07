@@ -64,7 +64,7 @@ mkdir -p "$CONFIG_DIR" "$DATA_DIR/cache" "$LOG_DIR"
 
 if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
     cp "$REPO_ROOT/contrib/gx10-deploy/config.yaml.example" "$CONFIG_DIR/config.yaml"
-    echo "    wrote $CONFIG_DIR/config.yaml - EDIT THE PLACEHOLDER API KEY BEFORE STARTING"
+    echo "    wrote $CONFIG_DIR/config.yaml"
 else
     echo "    $CONFIG_DIR/config.yaml already exists, leaving it as-is"
 fi
@@ -75,10 +75,20 @@ else
     echo "    $CONFIG_DIR/models.ini already exists, leaving it as-is"
 fi
 
+GENERATED_KEY=""
+if [ ! -f "$CONFIG_DIR/api.key" ]; then
+    GENERATED_KEY="$(openssl rand -hex 32)"
+    printf '%s' "$GENERATED_KEY" > "$CONFIG_DIR/api.key"
+    echo "    generated $CONFIG_DIR/api.key"
+else
+    echo "    $CONFIG_DIR/api.key already exists, leaving it as-is"
+fi
+
 chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
 chown -R "root:$SERVICE_USER" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
 chmod 640 "$CONFIG_DIR"/*.yaml "$CONFIG_DIR"/*.ini 2>/dev/null || true
+chmod 640 "$CONFIG_DIR/api.key"
 
 # Offer to migrate the invoking (non-root) user's existing HF model cache,
 # since ProtectHome=true in the unit means the service cannot read it later.
@@ -106,11 +116,9 @@ echo "    installed /etc/systemd/system/llama-server.service"
 cat <<EOF
 
 Install complete. Before starting:
-  1. Edit $CONFIG_DIR/config.yaml - replace the placeholder API key
-     (openssl rand -hex 32 makes a good one)
-  2. Edit $CONFIG_DIR/models.ini if you want different models than the
+  1. Edit $CONFIG_DIR/models.ini if you want different models than the
      Qwen3-Coder / Qwen3-32B example
-  3. If no cache was copied above, pre-pull each model as the service user
+  2. If no cache was copied above, pre-pull each model as the service user
      (llama-server has no download-only mode - run it for real once, on a
      scratch port, and Ctrl+C after "model loaded" / "listening on" appears;
      this also confirms the service account can load the model, not just
@@ -122,3 +130,15 @@ Then:
   sudo systemctl enable --now llama-server
   sudo journalctl -u llama-server -f
 EOF
+
+if [ -n "$GENERATED_KEY" ]; then
+    cat <<EOF
+
+Generated API key (also saved at $CONFIG_DIR/api.key, mode 640,
+readable by root and $SERVICE_USER only):
+
+  $GENERATED_KEY
+
+Save this now - it is not printed again on a re-run of this script.
+EOF
+fi

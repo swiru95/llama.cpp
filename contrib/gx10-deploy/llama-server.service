@@ -13,7 +13,16 @@ WorkingDirectory=/var/lib/llama-server
 Environment=LLAMA_CACHE=/var/lib/llama-server/cache
 Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
 
-ExecStart=@INSTALL_PREFIX@/bin/llama-server --config /etc/llama-server/config.yaml
+# Router-identity flags (models-preset/models-max/models-autoload/port/
+# api-key) MUST be given here on the command line, never inside the
+# --config file below. The router hands its own --config argument down to
+# every spawned child verbatim, and each child re-parses that file
+# independently from scratch - so a router-only key inside it would make
+# every child think it should also be a router and spawn two more
+# children, recursively, without bound. Settings that ARE fine to also
+# apply identically to every child instance (audit log, RBAC/OIDC/mTLS)
+# belong in config.yaml instead.
+ExecStart=@INSTALL_PREFIX@/bin/llama-server --port 8080 --models-preset /etc/llama-server/models.ini --models-max 2 --models-autoload --api-key-file /etc/llama-server/api.key --config /etc/llama-server/config.yaml
 
 Restart=on-failure
 RestartSec=5
