@@ -1,6 +1,14 @@
 # Installed to /etc/llama-server/models.ini by install.sh (not overwritten on
 # re-install if it already exists there - edit the live copy, not this file).
 # See tools/server/README.md "Model presets" for the full format.
+#
+# hf-repo is required explicitly in each section below: a section name that
+# merely LOOKS like an HF repo:quant string is not enough on its own - the
+# router only auto-infers a model's source from an already-known match
+# (a cache hit, or a --models-dir scan), and does nothing to fetch one on a
+# cold cache. Without hf-repo here, a spawned child gets --alias/--ctx-size/
+# --n-gpu-layers but no actual model source, and silently sits idle as an
+# empty router instead of loading or erroring clearly.
 
 version = 1
 
@@ -9,7 +17,9 @@ ctx-size = 32768
 n-gpu-layers = 999
 
 [Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M]
+hf-repo = Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
 load-on-startup = true
 
 [Qwen/Qwen3-32B-GGUF:Q4_K_M]
+hf-repo = Qwen/Qwen3-32B-GGUF:Q4_K_M
 load-on-startup = true

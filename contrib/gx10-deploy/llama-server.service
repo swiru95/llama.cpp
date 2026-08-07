@@ -12,6 +12,13 @@ WorkingDirectory=/var/lib/llama-server
 
 Environment=LLAMA_CACHE=/var/lib/llama-server/cache
 Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
+# Pin empty regardless of what the system-wide environment sets (Ubuntu's
+# systemd reads /etc/environment into every service's default environment
+# by default) - these are public models, no token is ever needed, and an
+# expired/revoked ambient token causes a hard 401 instead of falling back
+# to anonymous access. A unit-file Environment= for a key always wins over
+# the inherited system default for that same key.
+Environment=HF_TOKEN=
 
 # Router-identity flags (models-preset/models-max/models-autoload/port/
 # api-key) MUST be given here on the command line, never inside the
