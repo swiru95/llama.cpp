@@ -1,0 +1,40 @@
+[Unit]
+Description=llama-server (RBAC/mTLS/OIDC auth fork)
+Documentation=https://github.com/swiru95/llama.cpp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llama-server
+Group=llama-server
+WorkingDirectory=/var/lib/llama-server
+
+Environment=LLAMA_CACHE=/var/lib/llama-server/cache
+Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
+
+ExecStart=@INSTALL_PREFIX@/bin/llama-server --config /etc/llama-server/config.yaml
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening. GPU access needs /dev/nvidia* device nodes - do NOT set
+# PrivateDevices=true here. install.sh adds the service user to whichever
+# of "video"/"render" owns those nodes on this system; if inference fails
+# with a CUDA init error after install, check `ls -l /dev/nvidia*` against
+# `id llama-server` and add the missing group manually.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llama-server /var/log/llama-server
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
