@@ -12,22 +12,22 @@ WorkingDirectory=/var/lib/llama-server
 
 Environment=LLAMA_CACHE=/var/lib/llama-server/cache
 Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
-# Pin empty regardless of what the system-wide environment sets (Ubuntu's
-# systemd reads /etc/environment into every service's default environment
-# by default) - these are public models, no token is ever needed, and an
-# expired/revoked ambient token causes a hard 401 instead of falling back
-# to anonymous access. A unit-file Environment= for a key always wins over
-# the inherited system default for that same key.
-Environment=HF_TOKEN=
-# Same reasoning, different mechanism: MODEL_ENDPOINT/HF_ENDPOINT
-# (common_get_model_endpoint, common/common.cpp) override the default
-# https://huggingface.co/ base URL, and common_http_client (common/http.h)
-# sends any userinfo embedded in that URL as HTTP Basic Auth. An ambient
-# override pointing at an internal mirror with stale embedded credentials
-# would produce exactly this failure mode and would NOT be fixed by
-# pinning HF_TOKEN alone, since it is a completely separate code path.
-Environment=MODEL_ENDPOINT=
-Environment=HF_ENDPOINT=
+# Actually REMOVE these from the service's environment, regardless of what
+# the system-wide environment sets (Ubuntu's systemd reads /etc/environment
+# into every service's default environment by default) - these are public
+# models, no token or mirror override is ever needed. UnsetEnvironment=,
+# not Environment=KEY= : the latter sets an EMPTY value, which is NOT the
+# same as absent. HF_TOKEN's own validity check treats empty the same as
+# absent so that one happens to be harmless either way, but
+# common_get_model_endpoint (common/common.cpp) only checks "is this env
+# var pointer non-null", not "is it non-empty" - an empty-but-present
+# HF_ENDPOINT/MODEL_ENDPOINT is read as "override the base URL to the
+# empty string", which broke resolution outright ("invalid URL: no
+# scheme") rather than falling back to the real default. UnsetEnvironment
+# makes getenv() return NULL, which is what actually triggers that
+# fallback - confirmed by hitting exactly this failure mode with the
+# Environment=KEY= form before switching to this one.
+UnsetEnvironment=HF_TOKEN MODEL_ENDPOINT HF_ENDPOINT
 
 # Router-identity flags (models-preset/models-max/models-autoload/port/
 # api-key) MUST be given here on the command line, never inside the
