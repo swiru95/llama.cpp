@@ -25,6 +25,11 @@
 // how server-http.cpp includes it unconditionally.
 #include "vendor/cpp-httplib/httplib.h"
 
+namespace {
+    // Track whether mTLS is enabled (set by configure(), checked by enabled())
+    bool g_mtls_enabled = false;
+}
+
 // F008b: Parse and validate mTLS flags from common_params into a server_mtls_config.
 bool server_mtls::configure(const common_params & params, server_mtls_config & out) {
     out = server_mtls_config{};
@@ -99,6 +104,7 @@ bool server_mtls::configure(const common_params & params, server_mtls_config & o
 
     // Populate the config.
     out.enabled = enabled;
+    g_mtls_enabled = enabled;  // track for runtime checks (e.g., in middleware)
     out.require_cert = require_cert;
     out.client_ca_file = params.mtls_client_ca_file;
     out.client_ca_dir = params.mtls_client_ca_dir;
@@ -108,6 +114,10 @@ bool server_mtls::configure(const common_params & params, server_mtls_config & o
     out.crl_reload_interval = params.mtls_crl_reload_interval;
 
     return true;
+}
+
+bool server_mtls::enabled() {
+    return g_mtls_enabled;
 }
 
 // Build gate: F016 is supported only on OpenSSL 3.0+.

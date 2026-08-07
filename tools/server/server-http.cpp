@@ -270,14 +270,16 @@ bool server_http_context::init(const common_params & params) {
         // F008c: Extract mTLS identity from the client certificate, if any. req.peer_cert()
         // is the only public accessor httplib exposes for the peer cert; all SAN parsing and
         // the C1 ambiguous-SAN handling live in server_mtls::extract_identity (server-mtls.cpp),
-        // this is the single call site.
+        // this is the single call site. Only call on TLS builds where mTLS is configured.
 #ifdef CPPHTTPLIB_SSL_ENABLED
-        mtls_identity id;
-        auto peer_cert = req.peer_cert();
-        if (server_mtls::extract_identity(&peer_cert, id)) {
-            ar.mtls_present = id.present;
-            ar.mtls_san_uri = id.san_uri;
-            ar.mtls_san_dns = id.san_dns;
+        if (server_mtls::enabled()) {
+            mtls_identity id;
+            auto peer_cert = req.peer_cert();
+            if (server_mtls::extract_identity(&peer_cert, id)) {
+                ar.mtls_present = id.present;
+                ar.mtls_san_uri = id.san_uri;
+                ar.mtls_san_dns = id.san_dns;
+            }
         }
 #endif
 

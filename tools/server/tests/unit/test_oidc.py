@@ -909,6 +909,42 @@ def test_jwks_down_at_runtime_fail_static_then_new_kid_denied(idp_pki, mock_idp,
         _cleanup(server)
 
 
+def test_same_kid_key_material_rotation_old_key_rejected(idp_pki, mock_idp, oidc_keys_full, monkeypatch):
+    # Performance fix: derived PEM cache must not serve a stale key when key
+    # material rotates under the SAME kid. Verify that when keypair A is
+    # replaced with keypair B under the same kid, a token signed with A is
+    # rejected after the JWKS refresh.
+    monkeypatch.setenv("LLAMA_OIDC_JWKS_TTL_SECONDS", "1")
+    monkeypatch.setenv("LLAMA_OIDC_JWKS_REFRESH_MIN_INTERVAL_SECONDS", "0")
+    server = _oidc_server(idp_pki, mock_idp, policy=_oidc_policy())
+    try:
+        server.start()
+        # Token signed with kid1's original keypair should validate initially
+        tok_original = _mint(mock_idp.issuer, oidc_keys_full.kid1_priv_pem, kid="kid1")
+        res = server.make_request("GET", "/props", headers={"Authorization": f"Bearer {tok_original}"})
+        assert res.status_code == 200, "initial token with kid1 original keypair must validate"
+
+        # IdP rotates: kid1 keeps its name but carries FRESH key material
+        priv_new, pub_new, priv_new_pem, _ = _gen_rsa()
+        rotated_jwk = _rsa_jwk(pub_new, "kid1")
+        mock_idp.set_jwks({"keys": [rotated_jwk]})
+        time.sleep(1.5)  # let cache TTL expire to force refresh
+
+        # Token signed with kid1's old keypair must now be rejected
+        # (the PEM cache must have been replaced atomically with the new JWKS)
+        res = server.make_request("GET", "/props", headers={"Authorization": f"Bearer {tok_original}"})
+        assert res.status_code == 401, "token signed with rotated-out keypair must be rejected"
+
+        # POSITIVE CONTROL: without this, any bug leaving the PEM cache EMPTY
+        # also yields 401 above, so the test would pass while all OIDC auth is
+        # dead. A token signed with the rotated-IN keypair must still validate.
+        tok_new = _mint(mock_idp.issuer, priv_new_pem, kid="kid1")
+        res = server.make_request("GET", "/props", headers={"Authorization": f"Bearer {tok_new}"})
+        assert res.status_code == 200, "token signed with the rotated-in keypair must validate"
+    finally:
+        _cleanup(server)
+
+
 # ---------------------------------------------------------------------------
 # Startup fail-closed matrix (F009b).
 # ---------------------------------------------------------------------------

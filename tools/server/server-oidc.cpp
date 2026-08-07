@@ -112,6 +112,7 @@ namespace {
     struct jwks_cache {
         std::string raw_jwks;
         std::set<std::string> kids;
+        std::unordered_map<std::string, std::string> pems;  // derived from raw_jwks, replaced atomically
         int64_t expires_at = 0;
         int64_t last_refresh = 0; // last refresh ATTEMPT (set regardless of outcome, S-1)
         int64_t last_unknown_kid_refresh = 0;
@@ -246,6 +247,9 @@ namespace {
         return std::min(ttl, g_jwks_ttl_ceiling);
     }
 
+    // Forward declaration
+    std::optional<std::string> jwk_to_pem(const jwt::jwk<traits> & jwk);
+
     // Helper: refresh JWKS (single-flight under mutex)
     // On success: replaces cache, sets expires_at, returns true
     // On failure: KEEPS existing cache (fail-static), returns false
@@ -264,19 +268,36 @@ namespace {
             return false;
         }
 
-        // Parse to extract kids
+        // Parse to extract kids and derive PEMs
         try {
             auto parsed = jwt::parse_jwks<traits>(new_jwks);
             std::set<std::string> new_kids;
+            std::unordered_map<std::string, std::string> new_pems;
             for (const auto & jwk : parsed) {
-                if (jwk.has_key_id()) {
-                    new_kids.insert(jwk.get_key_id());
+                if (!jwk.has_key_id()) {
+                    continue;
+                }
+                std::string kid = jwk.get_key_id();
+                // Duplicate kid: FIRST wins. This must match jwt-cpp's find_by_kid
+                // (a std::find_if over a vector), which the pre-cache code used via
+                // parsed.get_jwk(kid). Last-wins would let an appended duplicate-kid
+                // entry override the legitimate key for that kid.
+                if (!new_kids.insert(kid).second) {
+                    continue;
+                }
+                // Derive PEM for this JWK (if convertible); an unconvertible key
+                // (e.g. kty:oct) contributes a kid but no PEM, so it is rejected
+                // by the two-level gate in jwks_get_key rather than refetched.
+                auto pem_opt = jwk_to_pem(jwk);
+                if (pem_opt) {
+                    new_pems.emplace(kid, *pem_opt);
                 }
             }
 
             int64_t now = std::time(nullptr);
             g_jwks_cache.raw_jwks = std::move(new_jwks);
             g_jwks_cache.kids = std::move(new_kids);
+            g_jwks_cache.pems = std::move(new_pems);
             g_jwks_cache.expires_at = now + get_cache_ttl(max_age);
             g_jwks_cache.last_refresh = now;
             // F015: Increment success counter
@@ -783,19 +804,15 @@ static std::optional<std::string> jwks_get_key(const std::string & kid) {
         }
     }
 
-    // If kid is known, build and return the key
+    // If kid is known, look up the cached PEM
+    // Two-level gate: check kids first (outer condition must stay, for oct-key security invariant)
     if (g_jwks_cache.kids.count(kid)) {
-        try {
-            auto parsed = jwt::parse_jwks<traits>(g_jwks_cache.raw_jwks);
-            auto jwk = parsed.get_jwk(kid);
-            auto pem_opt = jwk_to_pem(jwk);
-            if (pem_opt) {
-                // S3: return by value (copy)
-                return *pem_opt;
-            }
-        } catch (...) {
-            // JWK not found or conversion failed
+        auto it = g_jwks_cache.pems.find(kid);
+        if (it != g_jwks_cache.pems.end()) {
+            // S3: return by value (copy)
+            return it->second;
         }
+        // kid is known but has no PEM (e.g., oct symmetric key) -> reject
         return std::nullopt;
     }
 
@@ -806,17 +823,11 @@ static std::optional<std::string> jwks_get_key(const std::string & kid) {
         g_jwks_cache.last_unknown_kid_refresh = now;
         refresh_jwks();
 
-        // Retry the lookup
+        // Retry the lookup after refresh
         if (g_jwks_cache.kids.count(kid)) {
-            try {
-                auto parsed = jwt::parse_jwks<traits>(g_jwks_cache.raw_jwks);
-                auto jwk = parsed.get_jwk(kid);
-                auto pem_opt = jwk_to_pem(jwk);
-                if (pem_opt) {
-                    return *pem_opt;
-                }
-            } catch (...) {
-                // JWK not found or conversion failed
+            auto it = g_jwks_cache.pems.find(kid);
+            if (it != g_jwks_cache.pems.end()) {
+                return it->second;
             }
         }
     }

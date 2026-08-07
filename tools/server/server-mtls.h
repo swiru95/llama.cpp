@@ -26,6 +26,10 @@ struct mtls_identity {
 };
 
 struct server_mtls {
+    // Check whether mTLS is enabled (set by configure()). Used to runtime-gate expensive
+    // operations like peer certificate extraction. Never throws.
+    static bool enabled();
+
     // Parse and validate common_params into a server_mtls_config. Returns false (and logs
     // SRV_ERR) on invalid combinations: unknown --mtls-required/--tls-min-version values,
     // negative --mtls-verify-depth, or (mode != off) without a CA file or dir. Never throws.
