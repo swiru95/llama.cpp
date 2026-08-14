@@ -12,21 +12,20 @@ WorkingDirectory=/var/lib/llama-server
 
 Environment=LLAMA_CACHE=/var/lib/llama-server/cache
 Environment=LD_LIBRARY_PATH=@INSTALL_PREFIX@/bin
-# Actually REMOVE these from the service's environment, regardless of what
-# the system-wide environment sets (Ubuntu's systemd reads /etc/environment
-# into every service's default environment by default) - these are public
-# models, no token or mirror override is ever needed. UnsetEnvironment=,
-# not Environment=KEY= : the latter sets an EMPTY value, which is NOT the
-# same as absent. HF_TOKEN's own validity check treats empty the same as
-# absent so that one happens to be harmless either way, but
-# common_get_model_endpoint (common/common.cpp) only checks "is this env
-# var pointer non-null", not "is it non-empty" - an empty-but-present
-# HF_ENDPOINT/MODEL_ENDPOINT is read as "override the base URL to the
-# empty string", which broke resolution outright ("invalid URL: no
-# scheme") rather than falling back to the real default. UnsetEnvironment
-# makes getenv() return NULL, which is what actually triggers that
-# fallback - confirmed by hitting exactly this failure mode with the
-# Environment=KEY= form before switching to this one.
+# Hygiene, not a bug fix: keep any system-wide token or registry-mirror
+# override out of this service's environment (Ubuntu's systemd reads
+# /etc/environment into every service by default). The models this unit
+# serves are public, so a credential reaching the downloader can only ever
+# be an accident, and a mirror override would silently change where model
+# weights are fetched from.
+#
+# It must be UnsetEnvironment=, never Environment=KEY= : the latter sets an
+# EMPTY value, which is not the same as absent. common_get_model_endpoint
+# (common/common.cpp) only checks whether the env var pointer is non-null,
+# not whether it is non-empty, so an empty-but-present HF_ENDPOINT is read
+# as "the base URL is the empty string" and breaks resolution outright
+# ("invalid URL: no scheme") instead of falling back to the default.
+# Confirmed by hitting exactly that failure with the Environment=KEY= form.
 UnsetEnvironment=HF_TOKEN MODEL_ENDPOINT HF_ENDPOINT
 
 # Router-identity flags (models-preset/models-max/models-autoload/port/

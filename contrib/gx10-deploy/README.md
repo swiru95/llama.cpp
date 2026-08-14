@@ -64,6 +64,23 @@ even desirable, to also apply identically to every spawned instance:
 `auth-audit-log`, `auth_policy`, `oidc-*`, `mtls-*`. Do not add
 `port`/`models-preset`/`models-max`/`models-autoload`/`api-key` to it.
 
+## Troubleshooting: "GET failed (401): Invalid username or password"
+
+This almost always means the `hf-repo` in `models.ini` **does not exist**, not
+that a credential is missing. The Hugging Face API will not confirm or deny
+the existence of a private repo to an anonymous caller, so a nonexistent,
+misspelled, or gated repo returns 401 rather than 404. Check the repo before
+suspecting tokens or systemd:
+
+```sh
+curl -o /dev/null -w '%{http_code}\n' \
+  https://huggingface.co/api/models/<owner>/<repo>
+```
+
+200 means public and resolvable; 401 means nonexistent, misspelled, or gated.
+Run it as your own user - if it 401s for you too, no service configuration
+can fix it.
+
 ## Notes
 
 - `ProtectHome=true` in the unit means the service cannot see your own
