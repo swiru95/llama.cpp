@@ -118,6 +118,22 @@ static std::filesystem::path get_server_exec_path() {
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
+    // The TLS/mTLS listener belongs to the router alone. Children serve plain
+    // HTTP on loopback and are reached only by the router's proxy, so they must
+    // not inherit any of this. Leaving the mTLS flags in place while the two
+    // lines above strip the cert/key is worse than useless: server_http_init
+    // hard-fails a child with "mTLS requires --ssl-cert-file and
+    // --ssl-key-file", so enabling mTLS on the router would kill every model
+    // instance at startup. Children remain protected by the api-key file they
+    // do inherit, and the principal the router resolved from the client
+    // certificate reaches them via the F005 propagation headers.
+    preset.unset_option("LLAMA_ARG_MTLS_CLIENT_CA_FILE");
+    preset.unset_option("LLAMA_ARG_MTLS_CLIENT_CA_DIR");
+    preset.unset_option("LLAMA_ARG_MTLS_REQUIRED");
+    preset.unset_option("LLAMA_ARG_MTLS_VERIFY_DEPTH");
+    preset.unset_option("LLAMA_ARG_MTLS_CRL_FILE");
+    preset.unset_option("LLAMA_ARG_MTLS_CRL_RELOAD_INTERVAL");
+    preset.unset_option("LLAMA_ARG_TLS_MIN_VERSION");
     preset.unset_option("LLAMA_API_KEY");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
