@@ -81,6 +81,76 @@ curl -o /dev/null -w '%{http_code}\n' \
 Run it as your own user - if it 401s for you too, no service configuration
 can fix it.
 
+## Troubleshooting: 400 "exceeds the available context size" at half your ctx-size
+
+Adding `parallel = N` to a `models.ini` section silently halves (or worse) the
+context each request can use. This is the single most confusing failure mode of
+this deployment, because the number in the 400 does not match the number in the
+config:
+
+```
+request (140010 tokens) exceeds the available context size (65536 tokens)
+```
+
+on a section that plainly says `ctx-size = 131072`.
+
+The cause is that `parallel` is *auto* by default, and auto is not just a slot
+count. `common/arg.cpp` defaults `n_parallel = -1`, and the server expands that
+in `tools/server/server.cpp`:
+
+```c
+if (params.n_parallel < 0) {
+    params.n_parallel = 4;
+    params.kv_unified = true;   // auto turns this on
+}
+```
+
+With `kv_unified` on, `llama_context` gives every sequence the whole context
+(`src/llama-context.cpp`):
+
+```c
+if (cparams.kv_unified) { cparams.n_ctx_seq = cparams.n_ctx; }
+else                    { cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max; }
+```
+
+Setting `parallel` explicitly does *not* enable `kv_unified` with it - that
+stays `false` per `common/common.h` - so the context starts being divided.
+`--kv-unified`'s own help text says as much: "default: enabled if number of
+slots is auto".
+
+So `parallel = 2` costs half the context, and does it at request time, long
+after the config looked fine at startup. Either drop the line and let it stay
+auto (4 slots, full context each), or keep it and add `kv-unified = true`:
+
+```ini
+[Coder]
+ctx-size = 131072
+parallel = 2
+kv-unified = true
+```
+
+Note the two settings trade against each other in memory: divided caches
+reserve `ctx-size` in total, while a unified cache lets any one sequence use
+all of it, so two long concurrent requests contend.
+
+## troubleshoot.sh
+
+`troubleshoot.sh` checks all of the above without changing anything:
+
+```sh
+contrib/gx10-deploy/troubleshoot.sh                     # on the server
+BASE=https://llama.example.local:8443 LLAMA_API_KEY=... \
+  contrib/gx10-deploy/troubleshoot.sh                   # from a workstation
+contrib/gx10-deploy/troubleshoot.sh --load              # also load idle models
+```
+
+It reports configured vs actually-usable context per model, flags any section
+setting `parallel` without `kv-unified`, rejects router-identity keys that have
+crept into `config.yaml`, verifies every `hf-repo` resolves, and warns about
+`LLAMA_ARG_*` leaking in from `/etc/environment`. Without `--load` it only
+reads state, so it is safe to run against a busy server; unloaded models simply
+report no effective context until you pass `--load`.
+
 ## Notes
 
 - `ProtectHome=true` in the unit means the service cannot see your own
