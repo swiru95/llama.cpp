@@ -145,6 +145,53 @@ def test_router_models_max_evicts_lru():
     assert _get_model_status(first) == "unloaded"
 
 
+def test_router_models_max_never_evicts_a_loading_model():
+    # A model that is still loading must never be chosen as the LRU victim.
+    # Its last_used is stamped once when the instance is spawned and does not
+    # advance while it loads, so any model that is actively serving refreshes
+    # past it and the loading one becomes the oldest. Evicting it force-kills
+    # the child mid-load, and the caller waiting in ensure_model_ready() sees
+    # the non-zero exit as "failed to load" rather than as an eviction.
+    global server
+    server.models_max = 2
+    server.start()
+
+    resident = "ggml-org/test-model-stories260K:F32"
+    loading = "ggml-org/tinygemma3-GGUF:Q8_0"
+    third = "ggml-org/test-model-stories260K-infill:F32"
+
+    _load_model_and_wait(resident, timeout=120)
+
+    # Start the second load but do not wait for it to finish.
+    res = server.make_request("POST", "/models/load", data={"model": loading})
+    assert res.status_code == 200
+
+    # Only meaningful while we actually catch it mid-load.
+    if _get_model_status(loading) != "loading":
+        pytest.skip(f"{loading} finished loading too quickly to exercise the race")
+
+    # Make the resident model the more recently used of the two, so that the
+    # still-loading one is now the oldest and would be picked by a naive LRU.
+    server.make_request(
+        "POST",
+        "/v1/chat/completions",
+        data={
+            "model": resident,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+    )
+
+    # Requesting a third model is over models_max and forces an eviction.
+    res = server.make_request("POST", "/models/load", data={"model": third})
+    assert res.status_code == 200
+
+    # The loading model must survive and go on to load; the resident one is
+    # the only legitimate victim.
+    assert _wait_for_model_status(loading, {"loaded"}, timeout=120) == "loaded"
+    assert _get_model_status(resident) == "unloaded"
+
+
 def test_router_no_models_autoload():
     global server
     server.no_models_autoload = True

@@ -735,12 +735,21 @@ void server_models::unload_lru() {
     {
         std::unique_lock<std::mutex> lk(mutex);
         for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
-                }
+            if (!m.second.meta.is_running()) {
+                continue;
+            }
+            count_active++; // a loading instance still occupies a slot
+            // but must never be the victim: last_used is stamped once at spawn
+            // and does not advance while loading, so a slow load is always the
+            // LRU once anything else is serving traffic. Evicting it force-kills
+            // the load, and the caller waiting in ensure_model_ready() sees the
+            // non-zero exit as "failed to load" rather than an eviction.
+            if (m.second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+                continue;
+            }
+            if (m.second.meta.last_used < lru_last_used) {
+                lru_model_name = m.first;
+                lru_last_used = m.second.meta.last_used;
             }
         }
     }
