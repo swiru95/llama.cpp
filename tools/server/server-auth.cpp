@@ -26,8 +26,8 @@
 #  include <arpa/inet.h>
 #endif
 
-#include "../vendor/nlohmann/json.hpp"
-using json = nlohmann::ordered_json;
+#include <nlohmann/json.hpp>
+using njson = nlohmann::ordered_json;
 
 // Runtime route table and auth state
 namespace {
@@ -577,14 +577,14 @@ static void audit_emit(const server_auth_request & r, const std::string & norm_p
 }
 
 // Load policy from JSON file
-static json load_policy_json(const std::string & path) {
+static njson load_policy_json(const std::string & path) {
     std::ifstream ifs(path);
     if (!ifs.is_open()) {
         SRV_ERR("failed to open policy file: %s\n", path.c_str());
         return nullptr;
     }
     try {
-        json policy;
+        njson policy;
         ifs >> policy;
         return policy;
     } catch (const std::exception & e) {
@@ -655,7 +655,7 @@ bool server_auth::init(const common_params & params) {
     }
 
     // Determine operating mode and load policy
-    json policy;
+    njson policy;
     bool has_policy_file = !params.auth_policy_file.empty();
     bool has_policy_inline = !params.auth_policy_inline.empty();  // F012c
 
@@ -757,7 +757,7 @@ bool server_auth::init(const common_params & params) {
             }
         } else {  // has_policy_inline
             try {
-                policy = json::parse(params.auth_policy_inline);
+                policy = njson::parse(params.auth_policy_inline);
             } catch (const std::exception & e) {
                 SRV_ERR("failed to parse inline auth_policy: %s\n", e.what());
                 return false;
@@ -825,7 +825,7 @@ bool server_auth::init(const common_params & params) {
     g_auth_enabled = has_policy || has_api_keys || has_trusted_proxies || has_mtls || has_oidc || has_introspect;
 
     // Load or use default roles
-    json roles;
+    njson roles;
     if (!policy.is_null() && policy.contains("roles")) {
         // F012c: roles key present but malformed (e.g. null) must fail closed,
         // not silently fall back to the compiled-in default roles.
@@ -836,11 +836,11 @@ bool server_auth::init(const common_params & params) {
         roles = policy["roles"];
     } else {
         // Compiled-in default roles
-        roles = json::object();
-        roles["admin"] = json::array({
+        roles = njson::object();
+        roles["admin"] = njson::array({
             "INFER", "READ_STATE", "METRICS", "ADMIN_STATE", "ADMIN_MODELS"
         });
-        roles["user"] = json::array({"INFER"});
+        roles["user"] = njson::array({"INFER"});
     }
 
     // Validate and build role -> perms map
@@ -1201,8 +1201,8 @@ static std::vector<std::string> extract_oidc_roles(const std::string & claims_js
                                                     const std::vector<std::string> & segments) {
     std::vector<std::string> result;
     try {
-        json claims = json::parse(claims_json);
-        json * current = &claims;
+        njson claims = njson::parse(claims_json);
+        njson * current = &claims;
 
         // Walk the dot-separated path
         for (const auto & seg : segments) {
