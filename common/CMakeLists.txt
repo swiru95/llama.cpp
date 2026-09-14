@@ -109,6 +109,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-dflash2.cpp
+    speculative-dflash2.h
     subproc.cpp
     subproc.h
     trie.cpp

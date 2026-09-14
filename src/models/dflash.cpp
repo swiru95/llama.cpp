@@ -472,6 +472,13 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
+// Row layout (per block position i):
+//   row[0 .. top_k-1]        candidate token ids, F32-cast
+//   row[top_k + p*top_k + c] score of predecessor candidate p -> candidate c, unary logit of c included
+// This row layout is a CONTRACT with the lattice consumer in common/speculative-dflash2.cpp.
+// Any reordering of the packing (candidate-id vs transition-score blocks) or change to the
+// p-major vs c-major convention will silently break the CPU-side walk without triggering an assertion.
+// Do not reorder without verifying common/speculative-dflash2.cpp and its unit tests.
 static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
